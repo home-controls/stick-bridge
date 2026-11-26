@@ -162,6 +162,31 @@ static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *
     return ret;
 }
 
+// GitHub's asset store now and then answers a fresh release with a server error (seen: "HTTP 618" right after a
+// release was published) and a moment later serves it fine. One more try after 2 s, from the start of the
+// redirect chain (a new signed address), and what the server said goes to the log.
+static void log_error_body(esp_http_client_handle_t c, int status, const char *url) {
+    char eb[160];
+    int er = esp_http_client_read(c, eb, sizeof(eb) - 1);
+    eb[er > 0 ? er : 0] = 0;
+    for (char *q = eb; *q; q++)
+        if (*q < 0x20 || *q > 0x7E) *q = ' ';
+    const char *h = strstr(url, "://");
+    ESP_LOGW(TAG, "%.48s answered HTTP %d: %s", h ? h + 3 : url, status, eb);
+}
+
+static esp_http_client_handle_t open_url_retry(const char *url, int *status, int64_t *len, const char **why) {
+    for (int attempt = 0;; attempt++) {
+        esp_http_client_handle_t c = open_url(url, status, len, why);
+        bool server_trouble = !c || *status >= 500;
+        if (c && *status >= 400) log_error_body(c, *status, url);
+        if (!server_trouble || attempt >= 1) return c;
+        if (c) esp_http_client_cleanup(c);
+        ESP_LOGW(TAG, "%s: trying once more in 2 s", c ? "server error" : *why ? *why : "no connection");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
 // ---------------------------------------------------------------- check
 
 static void do_install(void);
@@ -183,7 +208,7 @@ static void do_check(void) {
     int status = 0, n = 0;
     int64_t len;
     const char *why = NULL;
-    esp_http_client_handle_t c = open_url(update_url(&cfg), &status, &len, &why);
+    esp_http_client_handle_t c = open_url_retry(update_url(&cfg), &status, &len, &why);
     if (c) {
         while (n < MANIFEST_MAX) {
             int r = esp_http_client_read(c, body + n, MANIFEST_MAX - n);
@@ -275,7 +300,7 @@ static void do_install(void) {
     esp_http_client_handle_t c = NULL;
     if (!buf || !part) fail = "out of memory";
     else if (part->size < (size_t)r.size) fail = "the release doesn't fit the firmware slot";
-    else if (!(c = open_url(r.url, &status, &len, &fail))) {
+    else if (!(c = open_url_retry(r.url, &status, &len, &fail))) {
         // fail says why
     } else if (status != 200) fail = "the download answered with an error";
     else if (len > 0 && len != r.size) fail = "the download's size doesn't match the release";

@@ -2,6 +2,10 @@
 
 Each version's notes are what the bridge shows before installing it, so keep them under 500 bytes.
 
+## 2.0.2
+
+Updates, firmware checks and the stick list try once more when GitHub's download server answers with a server error (it sometimes does for a few minutes after a release is published), and the server's message goes to the log.
+
 ## 2.0.1
 
 More free memory: the radio tasks' stacks and the network buffers moved to PSRAM and the other stacks were trimmed to what they use (about 50 KB more internal RAM free than 2.0.0). System shows every task's stack and the heaps. The header shows one pill per radio, named after its app.

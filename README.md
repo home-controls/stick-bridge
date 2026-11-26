@@ -15,7 +15,7 @@ spot. Plug a stick in and it sets itself up.
 It also keeps an eye on the links: a dashboard shows how each app and its stick are getting on,
 which devices it hears and how well, and warns you about trouble.
 
-![The bridge's dashboard: health, traffic, response time and the serial link](docs/screenshots/overview.png)
+![The bridge's dashboard: every radio's health, traffic and clients together](docs/screenshots/overview.png)
 
 ## What it does
 
@@ -36,9 +36,9 @@ which devices it hears and how well, and warns you about trouble.
   be formatted from the dashboard).
 - **Works with Zigbee Studio**, which shows the bridge's health next to your Zigbee network.
 
-| Devices it hears | Settings |
+| Devices it hears | Radios |
 | --- | --- |
-| ![Devices heard, with signal and delivery](docs/screenshots/devices.png) | ![Network, Zigbee2MQTT and stick settings](docs/screenshots/settings.png) |
+| ![Devices heard, with signal and delivery](docs/screenshots/devices.png) | ![Settings, Radios: each stick's role, port, baud rate and allowed host](docs/screenshots/settings.png) |
 
 ## What you need
 

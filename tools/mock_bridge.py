@@ -31,10 +31,13 @@ HA_IP = "192.168.1.10"
 sim.cfg.update({"ip": "192.168.1.50", "allow": HA_IP})
 for e in sim.events:
     e["text"] = e["text"].replace("172.30.33.5", HA_IP)
-# Recordings carry real devices' IEEE addresses: keep each maker's prefix (the first 3 bytes), invent the rest
+# Recordings carry real devices' IEEE addresses: keep each maker's prefix (the first 3 bytes), invent the rest. The
+# hash is keyed with a secret made fresh each run and never stored: an unkeyed hash of 5 unknown bytes could be
+# searched back to the real address.
+_IEEE_KEY = os.urandom(16)
 for d in sim.devs:
     if d.get("ieee", "").startswith("0x") and len(d["ieee"]) == 18:
-        d["ieee"] = d["ieee"][:8] + hashlib.sha256(d["ieee"].encode()).hexdigest()[:10]
+        d["ieee"] = d["ieee"][:8] + hashlib.sha256(_IEEE_KEY + d["ieee"].encode()).hexdigest()[:10]
 
 DONGLE_ID = {"usb_chip": "CP210x", "model": "sonoff_dongle-pmg24", "model_name": "SONOFF Dongle Plus MG24", "radio": "EFR32MG24",
              "family": "Silicon Labs", "protocol": "EmberZNet (EZSP)", "protocol_detected": True, "z2m_adapter": "ember",

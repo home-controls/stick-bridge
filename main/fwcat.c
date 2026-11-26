@@ -130,6 +130,31 @@ static esp_http_client_handle_t gh_open(const char *url, bool api, int *status, 
     return ret;
 }
 
+// GitHub's asset store now and then answers a fresh release with a server error (seen: "HTTP 618" right after a
+// release was published) and a moment later serves it fine. One more try after 2 s, from the start of the
+// redirect chain (a new signed address), and what the server said goes to the log.
+static void log_error_body(esp_http_client_handle_t c, int status, const char *url) {
+    char eb[160];
+    int er = esp_http_client_read(c, eb, sizeof(eb) - 1);
+    eb[er > 0 ? er : 0] = 0;
+    for (char *q = eb; *q; q++)
+        if (*q < 0x20 || *q > 0x7E) *q = ' ';
+    const char *h = strstr(url, "://");
+    ESP_LOGW(TAG, "%.48s answered HTTP %d: %s", h ? h + 3 : url, status, eb);
+}
+
+static esp_http_client_handle_t gh_open_retry(const char *url, bool api, int *status, int64_t *len, const char **why) {
+    for (int attempt = 0;; attempt++) {
+        esp_http_client_handle_t c = gh_open(url, api, status, len, why);
+        bool server_trouble = !c || *status >= 500;
+        if (c && *status >= 400) log_error_body(c, *status, url);
+        if (!server_trouble || attempt >= 1) return c;
+        if (c) esp_http_client_cleanup(c);
+        ESP_LOGW(TAG, "%s: trying once more in 2 s", c ? "server error" : *why ? *why : "no connection");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
 // ---------------------------------------------------------------- downloadable dongle list
 
 #define DB_MAX 32768
@@ -224,7 +249,7 @@ static void db_refresh(void) {
     int64_t len;
     const char *why = NULL;
     char whybuf[40];
-    esp_http_client_handle_t c = gh_open(url, false, &status, &len, &why);
+    esp_http_client_handle_t c = gh_open_retry(url, false, &status, &len, &why);
     char *body = NULL;
     if (c && status == 200) {
         body = heap_caps_malloc(DB_MAX + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -411,7 +436,7 @@ static void do_check(int radio) {
         }
         int status;
         int64_t len;
-        c = gh_open(url, true, &status, &len, &why);
+        c = gh_open_retry(url, true, &status, &len, &why);
         if (c && status != 200) {
             set_error(R->error, sizeof(R->error), "GitHub answered %d%s", status,
                       status == 403 || status == 429 ? " (rate limited: try again in an hour)" : status == 404 ? " (no such repo or no releases)" : "");
@@ -487,7 +512,7 @@ static void do_download(void) {
         begun = true;
         int status;
         int64_t len;
-        h = gh_open(c.a.url, false, &status, &len, &why);
+        h = gh_open_retry(c.a.url, false, &status, &len, &why);
         if (h && status != 200) {
             snprintf(whybuf, sizeof(whybuf), "GitHub answered %d for the file", status);
             why = whybuf;
