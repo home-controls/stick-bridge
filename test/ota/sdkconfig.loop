@@ -1,0 +1,2 @@
+# OTA test builds: install anything newer from the test server on the PC running tools/ota_test.py
+CONFIG_BRIDGE_TEST_UPDATE_URL="http://192.168.1.20:8765/manifest.json"

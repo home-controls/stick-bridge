@@ -1,0 +1,98 @@
+menu "Zigbee Ethernet bridge"
+
+    config BRIDGE_DEFAULT_HOSTNAME
+        string "Default hostname"
+        default "zigbee-eth-bridge"
+
+    config BRIDGE_DEFAULT_STATIC
+        bool "Use a static IP by default"
+        default n
+
+    config BRIDGE_DEFAULT_IP
+        string "Default static IP"
+        default "192.168.1.50"
+
+    config BRIDGE_DEFAULT_MASK
+        string "Default subnet mask"
+        default "255.255.255.0"
+
+    config BRIDGE_DEFAULT_GW
+        string "Default gateway"
+        default "192.168.1.1"
+
+    config BRIDGE_DEFAULT_DNS
+        string "Default DNS server"
+        default "192.168.1.1"
+
+    config BRIDGE_DEFAULT_ALLOW
+        string "Default Z2M host (IP or CIDR, empty = anyone)"
+        default ""
+
+    config BRIDGE_DEFAULT_TCP_PORT
+        int "Default TCP port for Zigbee2MQTT"
+        default 6638
+
+    config BRIDGE_DEFAULT_BAUD
+        int "Default dongle baud rate"
+        default 115200
+
+    config BRIDGE_DEFAULT_TX_CHUNK
+        int "USB OUT chunk to the dongle (bytes, 0 = unpaced)"
+        range 0 64
+        default 64
+
+    config BRIDGE_DEFAULT_TX_GAP_US
+        int "Idle UART time between back-to-back chunks (us)"
+        range 0 5000
+        default 300
+
+    config BRIDGE_DEFAULT_XOFF_HONOR
+        bool "Hold writes to the dongle while it says XOFF"
+        default y
+
+    config BRIDGE_DEFAULT_XOFF_MAX_MS
+        int "Longest hold on one XOFF (ms)"
+        range 1 200
+        default 20
+
+    config BRIDGE_DEFAULT_FW_REPO
+        string "GitHub repo with dongle firmware releases (owner/name)"
+        default "Nerivec/silabs-firmware-builder"
+
+    config BRIDGE_TI_FW_REPO
+        string "GitHub repo with TI Z-Stack coordinator releases (owner/name)"
+        default "Koenkk/Z-Stack-firmware"
+
+    config BRIDGE_DONGLE_VID
+        hex "Dongle USB vendor ID (CP210x)"
+        default 0x10C4
+
+    config BRIDGE_DONGLE_PID
+        hex "Dongle USB product ID (CP210x)"
+        default 0xEA60
+
+    config BRIDGE_DEFAULT_UPDATE_URL
+        string "Release manifest on git (updates)"
+        default "https://github.com/home-controls/zigbee-bridge/releases/latest/download/manifest.json"
+
+    config BRIDGE_TEST_HOOKS
+        bool "Test hooks (POST /api/debug/watchdog): never in a release"
+        default n
+
+    config BRIDGE_TEST_UPDATE_URL
+        string "Test builds: install anything newer from this manifest, without a click"
+        depends on BRIDGE_TEST_HOOKS
+        default ""
+
+    config BRIDGE_TEST_BREAK
+        int "Test builds: 1 = crash at boot, 2 = no network (for rollback tests)"
+        depends on BRIDGE_TEST_HOOKS
+        range 0 2
+        default 0
+
+    config BRIDGE_TEST_DONGLE_URL
+        string "Test builds: run the dongle image store against <url>/1.gbl .. /4.gbl at boot and log the results"
+        depends on BRIDGE_TEST_HOOKS
+        default ""
+
+endmenu

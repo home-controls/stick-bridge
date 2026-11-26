@@ -1,0 +1,2 @@
+# Test builds only: POST /api/debug/watchdog?kind=task|heap|net
+CONFIG_BRIDGE_TEST_HOOKS=y

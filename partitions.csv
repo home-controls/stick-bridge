@@ -1,0 +1,11 @@
+# ESP32-P4-POE-ETH, 16 MB flash: two app slots for updates from the web page (no factory app), and room for a dongle image.
+# Name,    Type, SubType, Offset, Size
+nvs,       data, nvs,     ,       0x6000,
+otadata,   data, ota,     ,       0x2000,
+phy_init,  data, phy,     ,       0x1000,
+ota_0,     app,  ota_0,   ,       4M,
+ota_1,     app,  ota_1,   ,       4M,
+# The Zigbee dongle's own firmware (.gbl) waiting to be flashed (ncpflash.c registers the same area on older tables)
+dongle_fw, data, 0x40,   0x820000, 2M,
+# The stored log when the flash chip has no usable space above 16 MB (logstore.c registers the same area on older tables)
+zblog,     data, 0x41,   0xA20000, 2M,

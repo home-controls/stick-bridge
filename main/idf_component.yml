@@ -1,0 +1,7 @@
+dependencies:
+  idf:
+    version: ">=5.5"
+  # USB host driver for the dongle's CP2102N (opened as a vendor-specific bulk device)
+  espressif/usb_host_cdc_acm: "^2.1.0"
+  # zigbee-eth-bridge.local + _http._tcp
+  espressif/mdns: "^1.8.0"

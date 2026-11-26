@@ -1,0 +1,108 @@
+/* The bridge's own styles, on top of the Zigbee UI kit (kit/tokens.css, base.css, zigbee.css). */
+
+.auth-wrap { height: 100%; overflow-y: auto; display: grid; place-items: center; padding: 24px 16px; }
+.auth-card { width: min(420px, 100%); margin-top: 0; }
+.auth-card .brand { margin-bottom: 4px; }
+.auth-card .brand .icon { color: var(--accent); }
+.auth-card form { display: flex; flex-direction: column; gap: 12px; }
+.strength { height: 4px; border-radius: 2px; background: var(--surface-3); overflow: hidden; margin-top: 2px; }
+.strength > i { display: block; height: 100%; transition: width 0.2s, background 0.2s; }
+
+.health-ring { display: inline-flex; align-items: center; gap: 10px; }
+.health-ring svg { flex: none; transform: rotate(-90deg); }
+.health-ring .ring-track { stroke: var(--surface-3); }
+.health-ring .ring-arc { transition: stroke-dashoffset 0.6s ease, stroke 0.3s; }
+
+.buckets { display: flex; flex-direction: column; gap: 6px; }
+.bucket { display: grid; grid-template-columns: 64px minmax(0, 1fr) 70px; align-items: center; gap: 10px; font-size: 12.5px; }
+.bucket .label { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.bucket .meter { margin: 0; }
+.bucket .meter > i { background: var(--series-1); transition: width 0.4s; }
+.bucket .n { font-variant-numeric: tabular-nums; color: var(--muted); }
+
+.snippet { position: relative; background: var(--surface-2); border-radius: 10px; padding: 10px 12px; margin: 0; white-space: pre; overflow-x: auto; }
+.snippet .icon-btn { position: absolute; top: 4px; right: 4px; }
+.token { word-break: break-all; white-space: pre-wrap; padding-right: 44px; }
+
+.ev-list { list-style: none; margin: 0; padding: 0; }
+.ev-list li { display: grid; grid-template-columns: 22px 92px minmax(0, 1fr); gap: 8px; align-items: baseline; padding: 7px 4px; border-bottom: 1px solid var(--border); }
+.ev-list li:last-child { border-bottom: 0; }
+.ev-list .icon { position: relative; top: 3px; }
+.ev-list time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+.ev-list .l1 .icon { color: var(--warn); }
+.ev-list .l2 .icon, .ev-list .l2 .msg { color: var(--bad); }
+.ev-list .l0 .icon { color: var(--info); }
+.ev-list li.fresh { animation: flash 1.6s ease-out; }
+@keyframes flash { from { background: var(--accent-soft); } }
+
+.live { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.live .dot { animation: pulse 1.6s ease-in-out infinite; background: var(--ok); }
+
+.sys-log { height: 460px; }
+.log-line .log-lv { width: 18px; }
+.lv-i .log-lv { color: var(--info); }
+.lv-w .log-lv, .lv-w .log-msg { color: var(--warn); }
+.lv-e .log-lv, .lv-e .log-msg { color: var(--bad); }
+.lv-d .log-msg, .lv-v .log-msg { color: var(--muted); }
+
+.form-grid .wide { grid-column: 1 / -1; }
+.form-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+.form-msg { font-size: 13px; }
+.form-msg.ok { color: var(--ok); }
+.form-msg.bad { color: var(--bad); }
+input[type="file"].sr-only + .btn { cursor: pointer; }
+.num-cell { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.devices th.num-cell button { width: 100%; text-align: right; }
+.stats.five { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+
+/* layout fixes from a walk through the page in Chrome */
+.grid.two.stretch { align-items: stretch; }
+.grid.two.stretch > .card { display: flex; flex-direction: column; }
+.chart + .kv, .chart + .empty + .kv, .card > .empty + .kv { margin-top: 12px; }
+.cols-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
+/* cards side by side are the same height; fields pair up the same way in every card */
+.cols-2 > .card, .cols-3 > .card { display: flex; flex-direction: column; }
+.form-grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 520px) { .form-grid.two { grid-template-columns: minmax(0, 1fr); } }
+.cols-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; align-items: stretch; margin-bottom: 16px; }
+@media (max-width: 1000px) { .cols-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .cols-2, .cols-3 { grid-template-columns: minmax(0, 1fr); } }
+.stat-value .unit { font-size: 13px; }@media (max-width: 680px) { .stats, .stats.five { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; } .stat { padding: 12px; } .stat-value { font-size: 21px; } }
+.span-all { grid-column: 1 / -1; }
+.update-row { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.update-main { flex: 1 1 320px; min-width: 0; }
+.update-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 14.5px; }
+.update-head .icon { display: inline; vertical-align: -3px; }
+.update-notes { margin: 8px 0 0; white-space: pre-wrap; color: var(--muted); font-size: 13px; }
+.update-btns { margin-top: 0; }
+.update-form { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+@media (max-width: 680px) { .update-form { grid-template-columns: minmax(0, 1fr); } }
+.update-form .seg { align-self: flex-start; }
+
+/* log storage + stored log */
+.logstore { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; }
+@media (max-width: 760px) { .logstore { grid-template-columns: minmax(0, 1fr); } }
+.logstore .update-head { min-height: 26px; }
+.logstore .row-btns { margin-top: 10px; }
+.btn.disabled { pointer-events: none; opacity: 0.5; }
+.file-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 2px 16px; }
+.file-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.file-list a { display: inline-flex; align-items: center; gap: 6px; color: var(--text); text-decoration: none; font-variant-numeric: tabular-nums; }
+.file-list a:hover { color: var(--accent); }
+.link-btn { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; }
+.log-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.log-tools .search { flex: 1 1 220px; }
+.log-note { background: var(--accent-soft); }
+.log-note .log-lv, .log-note .log-msg { color: var(--accent); font-weight: 600; }
+.brand .logo, .splash .logo { flex: none; }
+
+/* Dongle firmware catalogue (System) */
+.fw-catalog { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 12px; }
+.fw-catalog-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.fw-catalog-head h4 { margin: 0; }
+.fw-catalog .table-wrap { margin-top: 8px; }
+.small-btn { padding: 4px 10px; font-size: 13px; }
+
+/* Homepage chart range */
+.head-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: flex-end; }
+.small-seg button { padding: 3px 10px; font-size: 12px; }
