@@ -67,6 +67,10 @@ bool settings_parse_allow(const char *s, uint32_t *addr, uint32_t *mask);
 // Peer address in lwIP order. Uses the saved Z2M host.
 bool settings_allow_peer(uint32_t peer);
 bool settings_allow_peer_radio(int radio, uint32_t peer);
+// The radio's rule is empty: any host on the network may connect.
+bool settings_radio_open_to_all(int radio);
+// What a rule that can't be read becomes: loopback, which no client on the network ever is.
+#define ALLOW_NOBODY "127.0.0.1"
 
 // Radios: which stick each keeps (radio_assign input), saving a radio's stick when it moved hub ports, and the
 // live role / name / port / baud of one radio.

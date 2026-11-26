@@ -540,8 +540,8 @@ def flash(name, image, dongle, *, app_baud=115200, new_baud=115200, expect_ok=Tr
     return res
 
 
-def gcheck(name, image, *, err_has=None, extra=None):
-    res = run(["check"], image, None)
+def gcheck(name, image, *, err_has=None, extra=None, spinel=False):
+    res = run(["check"], image, None, spinel=spinel)
     if err_has is None:
         ok = res["check"] == ""
     else:
@@ -576,8 +576,14 @@ def main():
     gcheck("5 bytes", b"\xeb\x17\xa6\x03\x08", err_has="too short")
     gcheck("bootloader upgrade inside", gbl(extra=tag(T_BOOTLOADER, bytes(64))), err_has="bootloader")
     gcheck("secure element upgrade inside", gbl(extra=tag(T_SE, bytes(64))), err_has="secure element")
-    gcheck("Thread firmware", gbl(app_type=2), err_has="Thread")
+    gcheck("Thread firmware on a Zigbee radio", gbl(app_type=2), err_has="Thread")
     gcheck("Bluetooth firmware", gbl(app_type=8), err_has="Bluetooth")
+    gcheck("Thread firmware on a Thread radio", gbl(app_type=2), spinel=True)
+    gcheck("MCU-tagged RCP (Simplicity Commander) on a Thread radio", gbl(app_type=0x10), spinel=True)
+    gcheck("Zigbee firmware on a Thread radio", gbl(app_type=1), spinel=True, err_has="not a Thread RCP")
+    gcheck("Bluetooth firmware on a Thread radio", gbl(app_type=8), spinel=True, err_has="Bluetooth")
+    gcheck("Zigbee + Thread (multiprotocol) on either", gbl(app_type=3))
+    gcheck("Zigbee + Thread (multiprotocol) on a Thread radio", gbl(app_type=3), spinel=True)
     gcheck("unknown tag", gbl(extra=tag(0x12345678, b"x")), err_has="unknown tag")
     gcheck("no firmware inside", gbl(prog=0), err_has="no firmware")
     gcheck("second header", gbl(extra=tag(T_HEADER, bytes(8))), err_has="second GBL header")
@@ -656,7 +662,8 @@ def main():
     for name, data in reals:
         flash(f"real file {name}", data, Dongle())
     # OpenThread RCP builds (Thread role): Spinel verification and the Spinel way into the bootloader
-    rcp = gbl(meta='{"metadata_version":3,"fw_type":"openthread_rcp","baudrate":460800}')
+    # a real RCP build says Thread in its application info (app_type 2), not Zigbee
+    rcp = gbl(app_type=2, meta='{"metadata_version":3,"fw_type":"openthread_rcp","baudrate":460800}')
     sp_ok = lambda want: (lambda r, d: None if r["after_spinel"].startswith(want) else f"after_spinel={r['after_spinel']!r}")
     flash("zigbee -> thread: verified over Spinel", rcp, Dongle(new_proto="spinel", new_baud=460800), new_baud=460800, spinel=True,
           extra=lambda r, d: sp_ok("SL-OPENTHREAD/2.6.1")(r, d) or (None if r["entered"] == "asked the firmware" else r["entered"]))

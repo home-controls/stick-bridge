@@ -2,6 +2,10 @@
 
 Each version's notes are what the bridge shows before installing it, so keep them under 500 bytes.
 
+## 2.1.0
+
+Security and robustness pass. Fixed a heap write from a crafted TI .hex, zip bombs and slow clients that froze the web server. The API token can't install firmware; logins lock out per address; first-boot setup only from the bridge's own address. Update sources must be https. A stuck stick no longer restarts the bridge. Thread RCP .gbl files flash on Thread radios. CI runs the tests on every push.
+
 ## 2.0.2
 
 Updates, firmware checks and the stick list try once more when GitHub's download server answers with a server error (it sometimes does for a few minutes after a release is published), and the server's message goes to the log.

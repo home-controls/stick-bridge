@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/time.h>
 
 #include "bridge.h"
@@ -24,6 +25,7 @@
 #include "sdlog.h"
 #include "ncpflash.h"
 #include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
@@ -60,7 +62,6 @@ typedef struct {  // what is kept in flash
 } session_rec_t;
 static session_t s_sessions[SESSIONS];
 static SemaphoreHandle_t s_sess_lock;
-static uint32_t s_fail_count, s_fail_window_s, s_locked_until_s;
 
 static int64_t epoch_now(void) {
     struct timeval tv;
@@ -163,23 +164,93 @@ static void drop_all_sessions(void) {
     xSemaphoreGive(s_sess_lock);
 }
 
-// Brute-force brake: 8 bad passwords in 5 minutes lock logins for 5 minutes.
-static bool login_locked(void) { return stats_uptime_s() < s_locked_until_s; }
+// Brute-force brake, per client address: 8 bad passwords in 5 minutes lock that address out for 5 minutes, doubling
+// each time it happens again (up to 2 h). Another host on the LAN can't lock the admin out this way. Only touched
+// from the server's task. Sixteen addresses at most (the one heard from longest ago makes room).
+#define LOGIN_HOSTS 16
+typedef struct {
+    uint8_t ip[16];  // as the server sees it (IPv4 arrives IPv4-mapped)
+    uint32_t window_s, last_s, locked_until_s;
+    uint8_t fails, lockouts;
+    bool used;
+} login_host_t;
+static login_host_t s_login[LOGIN_HOSTS];
+// And a ceiling for everyone together: more than 100 wrong passwords in an hour means someone is rotating addresses
+// (16 slots, IPv6). Then every login waits 15 minutes; signed-in browsers and the API token carry on.
+#define LOGIN_GLOBAL_MAX 100
+static uint32_t s_glob_window_s, s_glob_fails, s_glob_locked_until_s;
 
-static void note_login(bool ok) {
+static void peer_ip(httpd_req_t *req, uint8_t out[16]) {
+    struct sockaddr_in6 a;
+    socklen_t l = sizeof(a);
+    memset(out, 0, 16);
+    if (getpeername(httpd_req_to_sockfd(req), (struct sockaddr *)&a, &l) != 0) return;
+    if (a.sin6_family == AF_INET6) memcpy(out, &a.sin6_addr, 16);
+    else if (a.sin6_family == AF_INET) memcpy(out + 12, &((struct sockaddr_in *)&a)->sin_addr, 4);
+    static const uint8_t V4MAPPED[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}, V4[12] = {0};
+    // a real IPv6 address counts as its /64: one host can pick any address in its own subnet
+    if (memcmp(out, V4MAPPED, 12) != 0 && memcmp(out, V4, 12) != 0) memset(out + 8, 0, 8);
+}
+
+static login_host_t *login_host(httpd_req_t *req, bool create) {
+    uint8_t ip[16];
+    peer_ip(req, ip);
+    login_host_t *oldest = &s_login[0];
+    for (int i = 0; i < LOGIN_HOSTS; i++) {
+        login_host_t *h = &s_login[i];
+        if (h->used && memcmp(h->ip, ip, 16) == 0) return h;
+        if (!h->used || (oldest->used && h->last_s < oldest->last_s)) oldest = h;
+    }
+    if (!create) return NULL;
+    memset(oldest, 0, sizeof(*oldest));
+    memcpy(oldest->ip, ip, 16);
+    oldest->used = true;
+    return oldest;
+}
+
+static bool login_locked(httpd_req_t *req) {
     uint32_t now = stats_uptime_s();
+    if (now < s_glob_locked_until_s) return true;
+    login_host_t *h = login_host(req, false);
+    return h && now < h->locked_until_s;
+}
+
+static void note_login(httpd_req_t *req, bool ok) {
+    uint32_t now = stats_uptime_s();
+    login_host_t *h = login_host(req, !ok);
+    if (!h) return;
+    h->last_s = now;
     if (ok) {
-        s_fail_count = 0;
+        h->fails = 0;
+        h->lockouts = 0;
         return;
     }
-    if (now - s_fail_window_s > 300) {
-        s_fail_window_s = now;
-        s_fail_count = 0;
+    if (now - s_glob_window_s > 3600) {
+        s_glob_window_s = now;
+        s_glob_fails = 0;
     }
-    if (++s_fail_count >= 8) {
-        s_locked_until_s = now + 300;
-        s_fail_count = 0;
-        stats_event(EV_WARN, "Too many wrong passwords: logins locked for 5 minutes");
+    if (++s_glob_fails > LOGIN_GLOBAL_MAX && now >= s_glob_locked_until_s) {
+        s_glob_locked_until_s = now + 900;
+        s_glob_fails = 0;
+        stats_event(EV_WARN, "Over %d wrong passwords in an hour from many addresses: all logins wait 15 minutes", LOGIN_GLOBAL_MAX);
+    }
+    if (now - h->window_s > 300) {
+        h->window_s = now;
+        h->fails = 0;
+    }
+    if (++h->fails >= 8) {
+        uint32_t lock_s = 300u << (h->lockouts < 5 ? h->lockouts : 5);
+        if (lock_s > 7200) lock_s = 7200;
+        h->locked_until_s = now + lock_s;
+        h->fails = 0;
+        if (h->lockouts < 255) h->lockouts++;
+        char ip[48] = "?";
+        static const uint8_t V4MAPPED[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff}, V4[12] = {0};
+        if (memcmp(h->ip, V4MAPPED, 12) == 0 || memcmp(h->ip, V4, 12) == 0)
+            inet_ntoa_r(*(struct in_addr *)(h->ip + 12), ip, sizeof(ip));
+        else
+            inet6_ntoa_r(*(struct in6_addr *)h->ip, ip, sizeof(ip));
+        stats_event(EV_WARN, "Too many wrong passwords from %s: it can't log in for %lu minutes", ip, (unsigned long)(lock_s / 60));
     }
 }
 
@@ -205,9 +276,9 @@ static bool check_basic(httpd_req_t *req) {
     char *colon = strchr((char *)dec, ':');
     if (colon == NULL) return false;
     *colon = 0;
-    if (strcmp((char *)dec, "admin") != 0 || login_locked()) return false;
+    if (strcmp((char *)dec, "admin") != 0 || login_locked(req)) return false;
     bool ok = settings_check_password(colon + 1);
-    note_login(ok);
+    note_login(req, ok);
     if (ok) {
         memcpy(s_basic_hash, hh, 32);
         s_basic_gen = settings_password_gen();
@@ -246,6 +317,10 @@ static bool csrf_ok(httpd_req_t *req) {
 }
 
 // ---------------------------------------------------------------- helpers
+
+// This request may legitimately take long (an upload, a log download, a card format): up to 15 minutes instead of 30 s
+// before the stalled-connection monitor ends it. Only after authentication.
+static void mon_allow_long(httpd_req_t *req);
 
 static esp_err_t send_json(httpd_req_t *req, cJSON *root) {
     char *s = cJSON_PrintUnformatted(root);
@@ -297,27 +372,48 @@ static esp_err_t deny(httpd_req_t *req) {
             return send_error(req, "403 Forbidden", "missing X-Bridge");                   \
     } while (0)
 
-static cJSON *read_json(httpd_req_t *req) {
-    if (req->content_len <= 0 || req->content_len > 2048) return NULL;
+// The server has one task: a client that sends its body a byte every few seconds must not hold it. A JSON body
+// gets 10 s in all; an upload must average 8 KB/s once its first 15 s are up (a LAN does MB/s).
+#define BODY_DEADLINE_US (10 * 1000 * 1000LL)
+#define UPLOAD_GRACE_US (15 * 1000 * 1000LL)
+#define UPLOAD_MIN_BPS 8192
+// A body given up on (too slow, stalled): the server would still read and drop the rest of it after the handler, a
+// byte at a time if the client drips. Stop reading the socket instead. A client that has gone quiet still gets the
+// error answer; one that keeps sending gets a reset (lwIP aborts a connection that sends after SHUT_RD), which is
+// what a client dripping a body deserves.
+static void stop_reading(httpd_req_t *req) { shutdown(httpd_req_to_sockfd(req), SHUT_RD); }
+
+// Set when a handler has taken the whole body (dispatch: a body left unread gets a short purge budget, not 20 s).
+static bool s_body_read;
+
+static bool upload_too_slow(int64_t t0, int got) {
+    int64_t dt = esp_timer_get_time() - t0;
+    return dt > UPLOAD_GRACE_US && (int64_t)got * 1000000LL < (int64_t)UPLOAD_MIN_BPS * dt;
+}
+
+static cJSON *read_json_max(httpd_req_t *req, int max) {
+    if (req->content_len <= 0 || req->content_len > max) return NULL;
     char *buf = malloc(req->content_len + 1);
     if (!buf) return NULL;
-    int got = 0, quiet = 0;
+    int got = 0;
+    int64_t t0 = esp_timer_get_time();
     while (got < req->content_len) {
         int r = httpd_req_recv(req, buf + got, req->content_len - got);
-        // A client that goes quiet mid-body must not hold the server's only task: one receive timeout (5 s) and out.
-        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++quiet < 1) continue;
-        if (r <= 0) {
+        // quiet for one receive timeout (5 s), or the whole body taking over 10 s: out
+        if (r <= 0 || esp_timer_get_time() - t0 > BODY_DEADLINE_US) {
             free(buf);
+            stop_reading(req);
             return NULL;
         }
-        quiet = 0;
         got += r;
     }
     buf[got] = 0;
+    s_body_read = true;
     cJSON *j = cJSON_Parse(buf);
     free(buf);
     return j;
 }
+static cJSON *read_json(httpd_req_t *req) { return read_json_max(req, 2048); }
 
 static void ip_str(uint32_t ip, char *out) { inet_ntoa_r(*(struct in_addr *)&ip, out, 16); }
 
@@ -435,11 +531,25 @@ static void schedule_reboot(int ms) {
 
 // ---------------------------------------------------------------- page + session endpoints
 
+// The page only changes with the firmware: its ETag is the build's, so a reload is a 304 with no body.
 static esp_err_t h_index(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    static char etag[48];
+    if (!etag[0]) {
+        const esp_app_desc_t *d = esp_app_get_description();
+        snprintf(etag, sizeof(etag), "\"%02x%02x%02x%02x%02x%02x%02x%02x\"", d->app_elf_sha256[0], d->app_elf_sha256[1],
+                 d->app_elf_sha256[2], d->app_elf_sha256[3], d->app_elf_sha256[4], d->app_elf_sha256[5], d->app_elf_sha256[6],
+                 d->app_elf_sha256[7]);
+    }
+    char inm[48];
+    httpd_resp_set_hdr(req, "ETag", etag);
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", inm, sizeof(inm)) == ESP_OK && strcmp(inm, etag) == 0) {
+        httpd_resp_set_status(req, "304 Not Modified");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     return httpd_resp_send(req, (const char *)index_gz_start, index_gz_end - index_gz_start);
 }
 
@@ -449,12 +559,12 @@ static esp_err_t h_state(httpd_req_t *req) {
     // Each visit renews the cookie for another year, so a browser that keeps coming back stays signed in.
     char tok[48];
     size_t tl = sizeof(tok);
-    if (settings_has_password() && httpd_req_get_cookie_val(req, "zb_session", tok, &tl) == ESP_OK && session_ok(tok, false))
-        set_session_cookie(req, tok);
+    bool session = settings_has_password() && httpd_req_get_cookie_val(req, "zb_session", tok, &tl) == ESP_OK && session_ok(tok, false);
+    if (session) set_session_cookie(req, tok);
     cJSON *r = cJSON_CreateObject();
     cJSON_AddBoolToObject(r, "setup_required", !settings_has_password());
-    cJSON_AddBoolToObject(r, "authed", authed(req));
-    cJSON_AddBoolToObject(r, "locked", login_locked());
+    cJSON_AddBoolToObject(r, "authed", session || authed(req));  // one session check per poll, not two
+    cJSON_AddBoolToObject(r, "locked", login_locked(req));
     cJSON_AddBoolToObject(r, "api_token_set", settings_has_api_token());
     cJSON_AddStringToObject(r, "api", "zbbridge/1");
     cJSON_AddStringToObject(r, "version", esp_app_get_description()->version);
@@ -475,10 +585,32 @@ static bool password_ok(const char *pw, char *why, size_t n) {
     return true;
 }
 
+// The first-boot password is the one thing anyone may set without logging in. A web page elsewhere can make a browser
+// on the LAN talk to the bridge under the page's own name (DNS rebinding), so setup only answers to the bridge's IP
+// address or its hostname, and only for the first 30 minutes after a start (unplug and replug it to open it again).
+#define SETUP_WINDOW_S (30 * 60)
+static bool host_is_ours(httpd_req_t *req) {
+    char host[80], name[40];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) return false;
+    if (host[0] == '[') return true;  // an IPv6 literal
+    char *colon = strchr(host, ':');
+    if (colon) *colon = 0;
+    struct in_addr a;
+    if (inet_aton(host, &a)) return true;  // an IPv4 literal
+    bridge_settings_t cfg;
+    settings_get(&cfg);
+    snprintf(name, sizeof(name), "%s.local", cfg.hostname);
+    return strcasecmp(host, cfg.hostname) == 0 || strcasecmp(host, name) == 0;
+}
+
 static esp_err_t h_setup(httpd_req_t *req) {
     if (settings_has_password()) return send_error(req, "409 Conflict", "already set up");
     if (!csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");
-    cJSON *j = read_json(req);
+    if (!host_is_ours(req))
+        return send_error(req, "403 Forbidden", "Open the bridge by its IP address or hostname.local to set the password");
+    if (stats_uptime_s() > SETUP_WINDOW_S)
+        return send_error(req, "403 Forbidden", "Setting the password is open for 30 minutes after the bridge starts: unplug it and plug it back in, then set it");
+    cJSON *j = read_json_max(req, 256);  // {"password": up to 64 characters}
     const cJSON *pw = j ? cJSON_GetObjectItem(j, "password") : NULL;
     char why[64];
     if (!cJSON_IsString(pw) || !password_ok(pw->valuestring, why, sizeof(why))) {
@@ -498,12 +630,12 @@ static esp_err_t h_setup(httpd_req_t *req) {
 static esp_err_t h_login(httpd_req_t *req) {
     if (!settings_has_password()) return send_error(req, "403 Forbidden", "setup required");
     if (!csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");
-    if (login_locked()) return send_error(req, "429 Too Many Requests", "Too many attempts; try again in 5 minutes");
-    cJSON *j = read_json(req);
+    if (login_locked(req)) return send_error(req, "429 Too Many Requests", "Too many wrong passwords from this computer: try again later");
+    cJSON *j = read_json_max(req, 256);
     const cJSON *pw = j ? cJSON_GetObjectItem(j, "password") : NULL;
     bool ok = cJSON_IsString(pw) && settings_check_password(pw->valuestring);
     cJSON_Delete(j);
-    note_login(ok);
+    note_login(req, ok);
     if (!ok) return send_error(req, "401 Unauthorized", "Wrong password");
     char tok[33];
     new_session(tok);
@@ -983,6 +1115,7 @@ static esp_err_t h_logs_info(httpd_req_t *req) {
 // ?src=flash[&tail=<bytes>] or ?src=sd&name=<file>; &download=1 to save it as a file.
 static esp_err_t h_logs_text(httpd_req_t *req) {
     REQUIRE_AUTH(req);
+    mon_allow_long(req);
     char q[160] = "", src[8] = "flash", name[40] = "", v[16] = "";
     httpd_req_get_url_query_str(req, q, sizeof(q));
     httpd_query_key_value(q, "src", src, sizeof(src));
@@ -1075,9 +1208,27 @@ static bool get_ip(const cJSON *j, const char *k, uint32_t *out) {
 }
 
 static esp_err_t h_config_post(httpd_req_t *req) {
-    REQUIRE_CHANGE(req);
+    auth_kind_t kind = auth_kind(req);
+    if (kind == AUTH_NONE) return deny(req);
+    if (kind == AUTH_SESSION && !csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");
     cJSON *j = read_json(req);
     if (!j) return send_error(req, "400 Bad Request", "bad JSON");
+    // The API token (Zigbee Studio) only moves radio 1's allowed host, never to "anyone": update sources, the network
+    // and the radios are the dashboard's (a token holder could otherwise point updates at their own firmware).
+    if (kind == AUTH_TOKEN) {
+        const cJSON *it, *a = cJSON_GetObjectItem(j, "allow");
+        bool only_allow = true;
+        cJSON_ArrayForEach(it, j) if (!it->string || strcmp(it->string, "allow") != 0) only_allow = false;
+        uint32_t aa = 0, am = 0;
+        // a host or a range of at most a /8: "anyone" (empty, 0.0.0.0/0) or most of the internet stays the dashboard's
+        bool narrow = cJSON_IsString(a) && a->valuestring[0] && settings_parse_allow(a->valuestring, &aa, &am) &&
+                      (ntohl(am) & 0xFF000000u) == 0xFF000000u;
+        if (!only_allow || !narrow) {
+            cJSON_Delete(j);
+            return send_error(req, "403 Forbidden",
+                              "The API token can only set radio 1's allowed host to one address or a range of /8 or narrower; use the dashboard for the rest");
+        }
+    }
     bridge_settings_t c, old;
     settings_get(&c);
     old = c;
@@ -1103,7 +1254,7 @@ static esp_err_t h_config_post(httpd_req_t *req) {
         else c.tcp_port = (uint16_t)v->valueint;
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "update_url"))) {
-        if (!cJSON_IsString(v) || strlen(v->valuestring) >= sizeof(c.update_url)) bad = "Update source: an http(s):// address up to 191 characters";
+        if (!cJSON_IsString(v) || strlen(v->valuestring) >= sizeof(c.update_url)) bad = "Update source: an https:// address up to 191 characters";
         else strlcpy(c.update_url, v->valuestring, sizeof(c.update_url));
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "update_auto"))) {
@@ -1321,7 +1472,7 @@ static esp_err_t h_update_check(httpd_req_t *req) {
 }
 
 static esp_err_t h_update_install(httpd_req_t *req) {
-    REQUIRE_CHANGE(req);
+    REQUIRE_SESSION(req);  // installs firmware: never with the API token
     if (ncpflash_busy()) return send_error(req, "409 Conflict", "The stick's firmware is being flashed: wait for it to finish");
     char why[80];
     if (!updater_install(why, sizeof(why))) return send_error(req, "409 Conflict", why);
@@ -1359,7 +1510,8 @@ static esp_err_t h_factory(httpd_req_t *req) {
 // ---------------------------------------------------------------- firmware update
 
 static esp_err_t h_ota(httpd_req_t *req) {
-    REQUIRE_CHANGE(req);
+    REQUIRE_SESSION(req);  // installs firmware: never with the API token
+    mon_allow_long(req);
     if (ncpflash_busy()) return send_error(req, "409 Conflict", "The stick's firmware is being flashed: wait for it to finish");
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     int total = req->content_len;
@@ -1383,15 +1535,19 @@ static esp_err_t h_ota(httpd_req_t *req) {
     const size_t hdr_need = fw_header_len();
     stats_event(EV_INFO, "Firmware upload started (%d bytes)", total);
 
-    int quiet = 0;
+    int64_t t0 = esp_timer_get_time();
     while (got < total && fail == NULL) {
         int r = httpd_req_recv(req, (char *)buf + have, (4096 - have) < (total - got) ? (4096 - have) : (total - got));
-        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++quiet < 1) continue;
         if (r <= 0) {
             fail = r == HTTPD_SOCK_ERR_TIMEOUT ? "upload stalled" : "upload interrupted";
+            stop_reading(req);
             break;
         }
-        quiet = 0;
+        if (upload_too_slow(t0, got)) {
+            fail = "upload too slow";
+            stop_reading(req);
+            break;
+        }
         mbedtls_md5_update(&md5, buf + have, r);
         got += r;
         have += r;
@@ -1413,6 +1569,7 @@ static esp_err_t h_ota(httpd_req_t *req) {
         have = 0;
     }
     free(buf);
+    if (got == total) s_body_read = true;
     uint8_t d_md5[16];
     char h_md5[33];
     mbedtls_md5_finish(&md5, d_md5);
@@ -1474,8 +1631,8 @@ static esp_err_t h_dongles(httpd_req_t *req) {
     REQUIRE_AUTH(req);
     cJSON *a = cJSON_CreateArray();
     const char *last = "";
-    const dongle_model_t *ex = dongles_extra();
-    int nex = dongles_extra_count();
+    int nex;
+    const dongle_model_t *ex = dongles_extra(&nex);
     for (int i = 0; ex && i < nex; i++) add_model(a, &ex[i], true);
     for (const dongle_model_t *m = dongle_models(); m->id; m++) {
         if (strcmp(m->id, last) == 0 && a->child) continue;  // same model, another USB ID
@@ -1555,6 +1712,7 @@ static esp_err_t h_tasks(httpd_req_t *req) {
 // {"confirm": true}: erase the microSD card and make a fresh FAT file system on it.
 static esp_err_t h_sd_format(httpd_req_t *req) {
     REQUIRE_SESSION(req);
+    mon_allow_long(req);
     cJSON *j = read_json(req);
     bool yes = j && cJSON_IsTrue(cJSON_GetObjectItem(j, "confirm"));
     cJSON_Delete(j);
@@ -1604,6 +1762,7 @@ static void url_decode(char *s) {
 // Raw .gbl body; ?name=<file name>. Stored in the dongle image area, checked, kept only if it's fine.
 static esp_err_t h_dongle_image(httpd_req_t *req) {
     REQUIRE_SESSION(req);
+    mon_allow_long(req);
     char q[160], name[96] = "";
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK && httpd_query_key_value(q, "name", name, sizeof(name)) == ESP_OK)
         url_decode(name);
@@ -1615,19 +1774,25 @@ static esp_err_t h_dongle_image(httpd_req_t *req) {
         ncpflash_upload_end(false);
         return send_error(req, "500 Internal Server Error", "out of memory");
     }
-    int got = 0, quiet = 0;
+    int got = 0;
+    int64_t t0 = esp_timer_get_time();
     while (got < total && fail == NULL) {
         int r = httpd_req_recv(req, (char *)buf, total - got < 4096 ? total - got : 4096);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++quiet < 1) continue;
         if (r <= 0) {
             fail = r == HTTPD_SOCK_ERR_TIMEOUT ? "upload stalled" : "upload interrupted";
+            stop_reading(req);
             break;
         }
-        quiet = 0;
+        if (upload_too_slow(t0, got)) {
+            fail = "upload too slow";
+            stop_reading(req);
+            break;
+        }
         fail = ncpflash_upload_write(buf, r);
         got += r;
     }
     free(buf);
+    if (got == total) s_body_read = true;
     const char *end = ncpflash_upload_end(fail == NULL && got == total);
     if (fail == NULL) fail = end;
     if (fail) return send_error(req, "400 Bad Request", fail);
@@ -1779,8 +1944,117 @@ static esp_err_t h_debug_watchdog(httpd_req_t *req) {
 static bool s_web_running;
 bool web_running(void) { return s_web_running; }
 
+// ---------------------------------------------------------------- stalled connections
+// esp_http_server reads a request's headers in one go on its only task, each recv waiting up to recv_wait_timeout:
+// a client sending a header byte every few seconds would hold every other page (and Zigbee Studio) for an hour.
+// Every socket is tracked from accept to close; one that has sat outside a handler for STALL_US (headers never
+// finished, or an idle keep-alive) is shut down from here, which ends the server's recv at once. close_fn takes
+// the same lock before closing, so a socket number is never shut down after it was handed to someone else.
+#define STALL_US (20 * 1000 * 1000LL)
+#define MON_SLOTS CONFIG_LWIP_MAX_SOCKETS
+#define BUSY_CAP_US (30 * 1000 * 1000LL)        // a request in a handler: a slow reader can't hold the server longer
+#define BUSY_CAP_LONG_US (900 * 1000 * 1000LL)  // uploads, log downloads, formatting a card (mon_allow_long)
+typedef struct {
+    int fd;           // -1 = free
+    int64_t last_us;  // accept, or the end of its last request
+    int64_t busy_us;  // when its current handler started
+    bool busy;        // inside a handler
+    bool long_ok;     // this handler may run up to BUSY_CAP_LONG_US
+    bool shut;
+} mon_t;
+static mon_t s_mon[MON_SLOTS];
+static portMUX_TYPE s_mon_mux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t s_mon_lock;  // held around shutdown() and close()
+
+static mon_t *mon_find(int fd) {
+    for (int i = 0; i < MON_SLOTS; i++)
+        if (s_mon[i].fd == fd) return &s_mon[i];
+    return NULL;
+}
+
+static esp_err_t mon_open(httpd_handle_t hd, int fd) {
+    (void)hd;
+    portENTER_CRITICAL(&s_mon_mux);
+    mon_t *m = mon_find(-1);
+    if (m) *m = (mon_t){.fd = fd, .last_us = esp_timer_get_time()};
+    portEXIT_CRITICAL(&s_mon_mux);
+    return ESP_OK;
+}
+
+static void mon_close(httpd_handle_t hd, int fd) {
+    (void)hd;
+    xSemaphoreTake(s_mon_lock, portMAX_DELAY);
+    portENTER_CRITICAL(&s_mon_mux);
+    mon_t *m = mon_find(fd);
+    if (m) m->fd = -1;
+    portEXIT_CRITICAL(&s_mon_mux);
+    close(fd);
+    xSemaphoreGive(s_mon_lock);
+}
+
+static void mon_mark(int fd, bool busy) {
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_mon_mux);
+    mon_t *m = mon_find(fd);
+    if (m) {
+        m->busy = busy;
+        m->long_ok = false;
+        m->last_us = now;
+        if (busy) m->busy_us = now;
+    }
+    portEXIT_CRITICAL(&s_mon_mux);
+}
+
+static void mon_allow_long(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    portENTER_CRITICAL(&s_mon_mux);
+    mon_t *m = mon_find(fd);
+    if (m) m->long_ok = true;
+    portEXIT_CRITICAL(&s_mon_mux);
+}
+
+// Every route goes through here (the real handler is the route's user_ctx).
+#define PURGE_US (5 * 1000 * 1000LL)
+static esp_err_t dispatch(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    mon_mark(fd, true);
+    s_body_read = false;
+    esp_err_t e = ((esp_err_t (*)(httpd_req_t *))req->user_ctx)(req);
+    mon_mark(fd, false);
+    // A body the handler didn't take (refused before reading: no login, too big, wrong host) is read and dropped by the
+    // server after this. A real client's is already here and goes at once; a dripped one gets 5 s, then the monitor.
+    if (req->content_len > 0 && !s_body_read) {
+        portENTER_CRITICAL(&s_mon_mux);
+        mon_t *m = mon_find(fd);
+        if (m) m->last_us = esp_timer_get_time() - STALL_US + PURGE_US;
+        portEXIT_CRITICAL(&s_mon_mux);
+    }
+    return e;
+}
+
+static void mon_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        int64_t now = esp_timer_get_time();
+        xSemaphoreTake(s_mon_lock, portMAX_DELAY);
+        for (int i = 0; i < MON_SLOTS; i++) {
+            portENTER_CRITICAL(&s_mon_mux);
+            mon_t m = s_mon[i];
+            bool stale = m.fd >= 0 && !m.shut &&
+                         (m.busy ? now - m.busy_us > (m.long_ok ? BUSY_CAP_LONG_US : BUSY_CAP_US) : now - m.last_us > STALL_US);
+            if (stale) s_mon[i].shut = true;
+            portEXIT_CRITICAL(&s_mon_mux);
+            if (stale) shutdown(m.fd, SHUT_RDWR);  // the server sees the end and closes it (through mon_close)
+        }
+        xSemaphoreGive(s_mon_lock);
+    }
+}
+
 void web_start(void) {
     s_sess_lock = xSemaphoreCreateMutex();
+    s_mon_lock = xSemaphoreCreateMutex();
+    for (int i = 0; i < MON_SLOTS; i++) s_mon[i].fd = -1;
     sessions_load();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers = 48;
@@ -1789,6 +2063,8 @@ void web_start(void) {
     cfg.max_open_sockets = 12;
     cfg.recv_wait_timeout = 5;
     cfg.send_wait_timeout = 10;
+    cfg.open_fn = mon_open;
+    cfg.close_fn = mon_close;
     httpd_handle_t srv;
     if (httpd_start(&srv, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server failed to start");
@@ -1842,9 +2118,10 @@ void web_start(void) {
 #endif
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
-        httpd_uri_t u = {.uri = routes[i].uri, .method = routes[i].m, .handler = routes[i].h};
+        httpd_uri_t u = {.uri = routes[i].uri, .method = routes[i].m, .handler = dispatch, .user_ctx = (void *)routes[i].h};
         httpd_register_uri_handler(srv, &u);
     }
+    task_start(mon_task, "web_mon", 2560, NULL, 3, false);
     s_web_running = true;
     ESP_LOGI(TAG, "Dashboard on port 80 (%s)", settings_has_password() ? "login" : "first-boot setup");
 }

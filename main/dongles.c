@@ -1,6 +1,7 @@
 #include "dongles.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // Order matters: the first entry that matches wins, so specific strings come before generic ones on the
@@ -112,19 +113,32 @@ static const dongle_model_t GENERIC[] = {
 
 const dongle_model_t *dongle_models(void) { return MODELS; }
 
-static const dongle_model_t *volatile s_extra;
-static volatile int s_nextra;
+// The list and its count are published as one block behind one pointer, so a reader always gets a matching pair (two
+// separate variables could be read as the old list with the new, longer count). Old blocks are kept, like the lists
+// they point at: a stick identified earlier may still point into one. A new block only comes when dongles.json changed.
+typedef struct extra_list {
+    const dongle_model_t *m;
+    int n;
+    const struct extra_list *prev;  // the blocks before it, kept (and reachable) on purpose
+} extra_list_t;
+static const extra_list_t *s_list;
 
 void dongles_set_extra(const dongle_model_t *models, int n) {
-    s_nextra = 0;  // readers see either the old list with its count or an empty one, never a mix
-    s_extra = models;
-    s_nextra = n;
+    extra_list_t *l = malloc(sizeof(*l));
+    if (!l) return;  // keep the list we have
+    l->m = models;
+    l->n = n;
+    l->prev = __atomic_load_n(&s_list, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&s_list, l, __ATOMIC_RELEASE);
 }
-int dongles_extra_count(void) { return s_nextra; }
-const dongle_model_t *dongles_extra(void) { return s_extra; }
+const dongle_model_t *dongles_extra(int *n) {
+    const extra_list_t *l = __atomic_load_n(&s_list, __ATOMIC_ACQUIRE);
+    *n = l ? l->n : 0;
+    return l ? l->m : NULL;
+}
 bool dongle_is_extra(const dongle_model_t *m) {
-    const dongle_model_t *e = s_extra;
-    int n = s_nextra;
+    int n;
+    const dongle_model_t *e = dongles_extra(&n);
     return e && m >= e && m < e + n;
 }
 
@@ -155,8 +169,8 @@ static bool model_fits(const dongle_model_t *m, uint16_t vid, uint16_t pid, cons
 const dongle_model_t *dongle_match(uint16_t vid, uint16_t pid, const char *mfr, const char *product, bool has_cdc) {
     char both[112];
     snprintf(both, sizeof(both), "%s %s", mfr ? mfr : "", product ? product : "");
-    const dongle_model_t *ex = s_extra;
-    int nex = s_nextra;
+    int nex;
+    const dongle_model_t *ex = dongles_extra(&nex);
     for (int i = 0; ex && i < nex; i++)  // the downloaded list first
         if (model_fits(&ex[i], vid, pid, mfr, both)) return &ex[i];
     for (const dongle_model_t *m = MODELS; m->id; m++)

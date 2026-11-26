@@ -55,8 +55,10 @@ Zigbee2MQTT runs on. Zigbee2MQTT then uses (with your bridge's address):
 ## API (for Zigbee Studio and scripts)
 
 Auth: browser session cookie (+ `X-Bridge: 1` on changes), `Authorization: Bearer <token>` (create it under
-Settings → API access; shown once), or Basic `admin:<password>`. The token can read everything and change
-settings, not the password or the token. mDNS: `zigbee-eth-bridge.local`, service `_zbbridge._tcp`
+Settings → API access; shown once), or Basic `admin:<password>`. The token can read everything, reboot, reset the
+counters, check for updates and set radio 1's allowed host (`POST /api/config {"allow": "..."}`: one address or a range of /8 or narrower, never anyone). Everything
+else that changes the bridge (other settings, installing firmware, flashing sticks, the password, the token) needs the
+dashboard or Basic. mDNS: `zigbee-eth-bridge.local`, service `_zbbridge._tcp`
 (TXT `api=zbbridge/1`, `zigbee_port`, `version`).
 
 | Method | Path | |
@@ -73,10 +75,11 @@ settings, not the password or the token. mDNS: `zigbee-eth-bridge.local`, servic
 | GET | `/api/logs/text?src=flash[&tail=<bytes>]` / `?src=sd&name=<file>` | stored log as text/plain, oldest first; `&download=1` saves it as a file |
 | POST | `/api/logs/clear` | session only; hides the stored flash log (card files stay) |
 | GET / POST | `/api/config` | settings; POST answers with `reboot_required`. `tx_chunk` (0 = unpaced, 8-64), `tx_gap_us` (0-5000), `xoff_honor`, `xoff_max_ms` (1-200) apply at once. 1.0.23: `role` also `zwave`; 1.0.25: radios 2-3 also `zha` (refused on radio 1); `usb_fs_only`; `radios` `[{index, enabled, name, tcp_port, allow, baud, role}]` (radio 0's are the flat fields; either may be posted) |
-| POST | `/api/reboot`, `/api/stats/reset`, `/api/ota` (raw .bin body) | |
+| POST | `/api/reboot`, `/api/stats/reset` | |
+| POST | `/api/ota` (raw .bin body) | session or Basic, not the token |
 | POST | `/api/password`, `/api/token`, `/api/token/revoke`, `/api/factory-reset {confirm:"RESET"}` | session only |
 | GET | `/api/update` | updates from git: state, current, latest, notes, size, done, md5, sha256, error |
-| POST | `/api/update/check`, `/api/update/install` | install answers 409 with the reason when there's nothing to install |
+| POST | `/api/update/check`, `/api/update/install` | install answers 409 with the reason when there's nothing to install; install not with the token |
 | GET | `/api/dongle[?radio=n]` | the dongle's firmware: what it runs, the stored image (name, size, MD5, SHA-256, metadata, `problem`), flash progress/result. `?radio=n` (1.0.23) picks the radio these pages work on (it stays picked; 409 while another radio's stick is being flashed); the flash/check/download POSTs take it too |
 | GET | `/api/usb` | 1.0.23: USB devices on J3 (address, hub port, hub, speed, USB ID, product, radio), `fs_only`, `fs_forced`, `reforces`, `refused` |
 | POST | `/api/radio/forget` `{radio}` | 1.0.23, session only: free a radio's saved stick (409 while a stick is plugged into it) |

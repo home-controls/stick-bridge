@@ -150,6 +150,8 @@ static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *
             } else if (hop >= 4) *why = "too many redirects";
             else if (esp_http_client_set_redirection(c) != ESP_OK || esp_http_client_get_url(c, next, URL_MAX) != ESP_OK)
                 *why = "bad redirect";
+            else if (!TEST_LOOP && strncmp(next, "https://", 8) != 0)
+                *why = "redirected to a plain http address";  // the whole chain stays https (test builds' local server aside)
             else {
                 esp_http_client_cleanup(c);
                 continue;  // next hop, new connection
@@ -239,6 +241,10 @@ static void do_check(void) {
         return set_error("Update check failed: the release manifest is incomplete%s", NULL);
     }
     char url[256];
+    if (strncmp(file->valuestring, "http://", 7) == 0 && !TEST_LOOP) {
+        cJSON_Delete(j);
+        return set_error("Update check failed: the release manifest points at a plain http address%s", NULL);
+    }
     if (strncmp(file->valuestring, "https://", 8) == 0 || strncmp(file->valuestring, "http://", 7) == 0) {
         strlcpy(url, file->valuestring, sizeof(url));
     } else {  // relative to the manifest

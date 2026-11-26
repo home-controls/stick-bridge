@@ -1,0 +1,85 @@
+# Gitea's own CI: the host tests (ASan + UBSan), the dashboard page and the firmware build, on every push and
+# pull request. With this folder present Gitea ignores .github/workflows, so the GitHub release workflow never
+# runs here. Read-only: no secrets, publishes nothing.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-tests:
+    name: Host tests (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compiler, zlib, Python
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update -q
+          $SUDO apt-get install -y -q --no-install-recommends build-essential zlib1g-dev python3
+      - name: Tests
+        run: python3 test/host/run_all.py
+
+  web:
+    name: Dashboard page
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install (lockfile only, no install scripts)
+        run: npm ci --ignore-scripts
+      - name: Build (kit check, type check, bundle, inline into the firmware's page)
+        run: npm run build
+      - name: The committed page is this build
+        run: |
+          if [ -n "$(git status --porcelain -- ../main/web)" ]; then
+            git status --short -- ../main/web
+            echo "main/web/index.html doesn't match web/: run npm run build in web/ and commit the result"
+            exit 1
+          fi
+
+  checks:
+    name: Version and changelog
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The version has a changelog entry, short enough for the bridge to show
+        run: python3 tools/release_info.py
+
+  firmware:
+    name: Firmware
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:v5.5.6@sha256:bf72fe7a15c22849a9a94147301165a545fb8905d97c176cf748e3e4614cac84
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The IDF image has no node, which actions/checkout needs: fetch this commit with git and the job's token
+      - name: Checkout
+        env:
+          TOKEN: ${{ github.token }}
+          URL: ${{ github.server_url }}/${{ github.repository }}.git
+          SHA: ${{ github.sha }}
+        run: |
+          git init -q .
+          git config --global --add safe.directory "$PWD"
+          git -c "http.extraheader=Authorization: token $TOKEN" fetch -q --depth 1 "$URL" "$SHA"
+          git checkout -q FETCH_HEAD
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          idf.py build
+      - name: Size
+        run: ls -l build/zigbee_eth_bridge.bin

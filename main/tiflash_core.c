@@ -451,7 +451,11 @@ static bool erase(const tf_io_t *io, const tf_opts_t *o, tf_result_t *r, uint32_
         logf_(io, "Bank erase failed (%s): erasing sector by sector", status_name(st));
     }
     r->erase_how = "sector erase";
-    for (uint32_t a = 0; a < len; a += TF_SECTOR) {
+    // The last sector (the CCFG) goes first: interrupted anywhere after that, the chip boots with a blank CCFG, which
+    // keeps it in the ROM bootloader, rather than with the old one pointing at a half-erased application.
+    uint32_t nsec = len / TF_SECTOR;
+    for (uint32_t k = 0; k < nsec; k++) {
+        uint32_t a = k == 0 ? (nsec - 1) * TF_SECTOR : (k - 1) * TF_SECTOR;
         uint8_t p[4];
         wr32be(p, a);
         r->erased = true;
@@ -460,7 +464,7 @@ static bool erase(const tf_io_t *io, const tf_opts_t *o, tf_result_t *r, uint32_
             seterr(err, el, "Erasing the flash sector at 0x%05lx failed (%s)", (unsigned long)a, status_name(st));
             return false;
         }
-        progress(io, "erase", a + TF_SECTOR, len);
+        progress(io, "erase", (k + 1) * TF_SECTOR, len);
     }
     return true;
 }

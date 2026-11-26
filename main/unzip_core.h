@@ -15,6 +15,9 @@ typedef struct {
     int (*inflate)(void *ctx, const uint8_t *in, size_t in_len, size_t *in_used, uint8_t *out, size_t out_cap, size_t *out_made);
 } uz_inflater_t;
 
+// The most a zip may unpack to: a 704 KB CC26x2 image is ~2 MB as Intel HEX.
+#define UZ_MAX_OUT (4u * 1024 * 1024)
+
 typedef int (*uz_out_cb)(void *ctx, const uint8_t *data, size_t len);  // 0 ok, else stop with that error
 
 typedef struct {
@@ -24,7 +27,8 @@ typedef struct {
     int st;            // internal state
     uint8_t hdr[30];
     size_t hlen;
-    uint16_t method, flags, skip;  // skip: name + extra bytes still to drop
+    uint16_t method, flags;
+    uint32_t skip;                 // name + extra bytes still to drop
     uint32_t crc_want, csize, usize;
     uint32_t cin, uout, crc;       // compressed bytes consumed, bytes produced, running CRC-32
     char name[96];

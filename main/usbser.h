@@ -48,3 +48,5 @@ esp_err_t us_get_comm(us_port_t *p, us_comm_t *c);
 esp_err_t us_set_gpio(us_port_t *p, uint8_t mask, uint8_t state);
 // Received data as the chip delivered it -> the serial bytes (strips FTDI status). Returns the new length.
 size_t us_rx_fix(us_port_t *p, uint8_t *data, size_t len);
+// Called before each control request; weak no-op here, dongle.c feeds the task watchdog from its own task.
+void us_before_request(void);

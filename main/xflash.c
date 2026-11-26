@@ -257,7 +257,7 @@ typedef struct {
 
 static int ti_put(void *ctx, uint32_t addr, const uint8_t *d, size_t n) {
     ti_conv_t *c = ctx;
-    if (addr + n > c->cap) {
+    if (addr >= c->cap || n > c->cap - addr) {  // never addr + n: 32-bit, it can wrap
         ihex_fail(&c->hex, "data beyond any CC26x2 flash (over 704 KB)");
         return -1;
     }
@@ -303,6 +303,7 @@ static const char *ti_convert(xf_read_fn rd, uint32_t size, const char *name, ui
             if (rd(off, piece, n) != 0) why = "reading the stored image failed";
             else if (zip) why = uz_feed(uz, piece, n);
             else why = ihex_feed(&c.hex, (const char *)piece, n);
+            if ((off & 0xFFFF) == 0) vTaskDelay(1);  // a 4 MB unpack is seconds of CPU: let the idle task run
         }
         if (!why && zip) why = uz_finish(uz);
         if (why && c.err) why = c.err;

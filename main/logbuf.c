@@ -55,8 +55,16 @@ static int hook(const char *fmt, va_list ap) {
     va_copy(copy, ap);
     int n = vsnprintf(line, sizeof(line), fmt, copy);
     va_end(copy);
-    if (n > 0) append(line, n < (int)sizeof(line) ? (size_t)n : sizeof(line) - 1);
-    return s_orig ? s_orig(fmt, ap) : n;
+    bool cut = n >= (int)sizeof(line);
+    if (cut) {
+        // cut: keep the line ending, or the next line is glued on (and gets this one's time)
+        memcpy(line + sizeof(line) - 5, "...\n", 5);
+        n = sizeof(line) - 1;
+    }
+    if (n > 0) append(line, (size_t)n);
+    // The console gets the line already formatted (once, not twice per log call); a cut one the whole way, as before.
+    if (cut || !s_orig) return s_orig ? s_orig(fmt, ap) : n;
+    return n > 0 ? (int)fwrite(line, 1, (size_t)n, stdout) : n;
 }
 
 void logbuf_init(void) {
@@ -98,7 +106,10 @@ size_t logbuf_read(uint32_t since, char *out, size_t out_len, uint32_t *next) {
         // The dashboard wants the newest; the writer asks for at most what it can take and reads on.
         avail = out_len;
     }
-    for (size_t i = 0; i < avail; i++) out[i] = s_k.buf[(since + i) % LOGBUF_SIZE];
+    // two copies at most (the ring's end, then its start): interrupts stay off for microseconds, not a byte loop
+    size_t at = since % LOGBUF_SIZE, first = avail < LOGBUF_SIZE - at ? avail : LOGBUF_SIZE - at;
+    memcpy(out, s_k.buf + at, first);
+    memcpy(out + first, s_k.buf, avail - first);
     portEXIT_CRITICAL(&s_mux);
     *next = since + avail;
     return avail;

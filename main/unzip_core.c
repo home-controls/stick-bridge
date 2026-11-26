@@ -4,11 +4,18 @@
 
 enum { UZ_HDR, UZ_NAME, UZ_DATA, UZ_DONE, UZ_FAIL };
 
+// Nibble table: 2 lookups a byte, ~4x the bit-at-a-time loop, 64 bytes of table.
+static const uint32_t CRC_NIB[16] = {
+    0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC, 0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
+    0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C, 0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C,
+};
+
 uint32_t uz_crc32(uint32_t crc, const uint8_t *d, size_t n) {
     crc = ~crc;
     for (size_t i = 0; i < n; i++) {
         crc ^= d[i];
-        for (int b = 0; b < 8; b++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1)));
+        crc = (crc >> 4) ^ CRC_NIB[crc & 15];
+        crc = (crc >> 4) ^ CRC_NIB[crc & 15];
     }
     return ~crc;
 }
@@ -33,6 +40,7 @@ static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] 
 static const char *emit(uz_t *z, const uint8_t *d, size_t n) {
     if (!n) return NULL;
     z->crc = uz_crc32(z->crc, d, n);
+    if (n > UZ_MAX_OUT - z->uout) return fail(z, "the zip's file unpacks to more than any stick image");
     z->uout += (uint32_t)n;
     if (z->usize && z->uout > z->usize) return fail(z, "the zip's file is bigger than its header says");
     if (z->out && z->out(z->out_ctx, d, n) != 0) return fail(z, "the unpacked data was refused");
@@ -55,12 +63,15 @@ const char *uz_feed(uz_t *z, const uint8_t *data, size_t len) {
             z->crc_want = le32(z->hdr + 14);
             z->csize = le32(z->hdr + 18);
             z->usize = le32(z->hdr + 22);
-            z->skip = (uint16_t)(le16(z->hdr + 26) + le16(z->hdr + 28));
+            z->skip = (uint32_t)le16(z->hdr + 26) + le16(z->hdr + 28);  // up to 128 KB: no 16-bit wrap
             z->nlen = 0;
             if (z->flags & 0x0001) return fail(z, "the zip is encrypted");
             if (z->method != 0 && z->method != 8) return fail(z, "the zip uses a compression other than deflate");
             if (z->flags & 0x0008) return fail(z, "the zip streams its sizes after the data (not supported)");
             if (z->method == 0 && z->csize != z->usize) return fail(z, "stored zip entry with mismatched sizes");
+            // A zip bomb says 0 (or a lot) here: refuse before inflating a byte, not after minutes of it.
+            if (z->usize == 0) return fail(z, "the zip doesn't say how big its file is");
+            if (z->usize > UZ_MAX_OUT) return fail(z, "the zip's file unpacks to more than any stick image");
             z->st = UZ_NAME;
         } else if (z->st == UZ_NAME) {
             uint16_t name_len = le16(z->hdr + 26);

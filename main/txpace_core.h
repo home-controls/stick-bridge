@@ -49,6 +49,7 @@ typedef struct {
     int64_t wire_free_at;  // when the UART should have shifted out everything written so far
     bool xoff;             // the NCP said XOFF and no XON since
     int64_t xoff_at;       // time of the latest XOFF
+    uint32_t last_sent;    // bytes the last tp_write handed to the stick (all of them on TP_OK; fewer on a timeout)
     tp_stats_t st;
 } tp_state_t;
 

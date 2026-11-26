@@ -91,7 +91,8 @@ static void record(ihex_t *h) {
                 return;
             }
             uint64_t a = (uint64_t)h->base + off;
-            if (a + n > 0x100000000ull) {
+            // >=: a record ending exactly at 4 GB would make hi wrap to 0 (and a caller's addr + n overflow)
+            if (a + n >= 0x100000000ull) {
                 fail(h, "data record runs past 4 GB");
                 return;
             }

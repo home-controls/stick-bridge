@@ -94,6 +94,14 @@ bool settings_allow_peer_radio(int radio, uint32_t peer) {
 
 bool settings_allow_peer(uint32_t peer) { return settings_allow_peer_radio(0, peer); }
 
+bool settings_radio_open_to_all(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) return false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool open = s_allow_mask[radio] == 0;
+    xSemaphoreGive(s_lock);
+    return open;
+}
+
 void settings_radio_slots(radio_slot_t out[RADIO_MAX]) {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (int i = 0; i < RADIO_MAX; i++) out[i].bound = s_bound[i];
@@ -396,15 +404,22 @@ static void load(void) {
         s_has_tok = nvs_get_blob(h, "tok_hash", s_tok_hash, &tl) == ESP_OK && tl == sizeof(s_tok_hash);
         nvs_close(h);
     }
+    if (strncmp(s_cfg.update_url, "https://", 8) != 0) {  // saved by an older version that allowed http://
+        ESP_LOGW(TAG, "Update source '%s' isn't https: back to the default", s_cfg.update_url);
+        strlcpy(s_cfg.update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, sizeof(s_cfg.update_url));
+    }
+    // A saved rule that no longer reads (damaged settings) shuts the radio rather than opening it to the whole LAN:
+    // the raw radio port gives whoever connects the network key. Set it again on Settings, Radios.
     uint32_t a, m;
     if (!settings_parse_allow(s_cfg.allow, &a, &m)) {
-        ESP_LOGW(TAG, "Saved Z2M host '%s' is invalid; allowing anyone", s_cfg.allow);
-        s_cfg.allow[0] = '\0';
+        ESP_LOGE(TAG, "Saved radio 1 allowed host '%s' is unreadable: nobody may connect until it is set again", s_cfg.allow);
+        strlcpy(s_cfg.allow, ALLOW_NOBODY, sizeof(s_cfg.allow));
     }
     for (int i = 1; i < RADIO_MAX; i++) {
         if (!settings_parse_allow(s_cfg.radios[i].allow, &a, &m)) {
-            ESP_LOGW(TAG, "Radio %d: saved host '%s' is invalid; allowing anyone", i + 1, s_cfg.radios[i].allow);
-            s_cfg.radios[i].allow[0] = '\0';
+            ESP_LOGE(TAG, "Radio %d: saved allowed host '%s' is unreadable: nobody may connect until it is set again", i + 1,
+                     s_cfg.radios[i].allow);
+            strlcpy(s_cfg.radios[i].allow, ALLOW_NOBODY, sizeof(s_cfg.radios[i].allow));
         }
         if (s_cfg.radios[i].role > RADIO_ROLE_MAX) s_cfg.radios[i].role = RADIO_ROLE_ZHA;
     }
@@ -481,8 +496,9 @@ esp_err_t settings_save(const bridge_settings_t *in_raw, bool *reboot_needed, ch
         snprintf(err, err_len, "TCP port must be 1-65535 and not 80");
         return ESP_ERR_INVALID_ARG;
     }
-    if (strncmp(in->update_url, "https://", 8) != 0 && strncmp(in->update_url, "http://", 7) != 0) {
-        snprintf(err, err_len, "Update source must be an http(s):// address");
+    // https only: over plain http anyone on the path could hand the bridge a manifest, and with it the image's hashes
+    if (strncmp(in->update_url, "https://", 8) != 0) {
+        snprintf(err, err_len, "Update source must be an https:// address");
         return ESP_ERR_INVALID_ARG;
     }
     if (in->baud < 9600 || in->baud > 921600) {

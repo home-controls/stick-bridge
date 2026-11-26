@@ -16,6 +16,8 @@
 #include "cJSON.h"
 #include "esp_http_server.h"
 
+// Creates the card lock: call once before the log writer and the web server start.
+void sdlog_init(void);
 // Housekeeping (look for a card, check it's still there, make room). Called from the log writer's task.
 void sdlog_poll(void);
 // Appends stored-log text to the day file for epoch_ms (0 = clock not set: boot-<n>.log).

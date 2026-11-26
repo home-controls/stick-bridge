@@ -55,9 +55,11 @@ static int64_t s_cmd_pending[256];
 static uint16_t s_cmd_frame[256];
 
 void ezsp_decode_reset(void) {
+    stats_lock();  // the feeds hold it: no torn 64-bit send times read back as a bogus round trip
     memset(s_rx, 0, sizeof(s_rx));
     memset(s_ack_pending, 0, sizeof(s_ack_pending));
     memset(s_cmd_pending, 0, sizeof(s_cmd_pending));
+    stats_unlock();
 }
 
 static uint16_t crc16_ccitt(const uint8_t *d, size_t n) {
