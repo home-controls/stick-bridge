@@ -63,7 +63,11 @@ def main() -> int:
             req = urllib.request.Request(url, headers={"User-Agent": "zigbee-eth-bridge-test",
                                                         "Accept": "application/vnd.github+json"})
             p = Path(tmp.name) / name
-            p.write_bytes(urllib.request.urlopen(req, timeout=30).read())
+            try:
+                p.write_bytes(urllib.request.urlopen(req, timeout=30).read())
+            except OSError as e:  # no network, or GitHub's rate limit (403) on a shared CI runner: the selftest stands
+                print(f"skip live {name} ({e})")
+                continue
             files.append(p)
     for f in files:
         want = expected(f)

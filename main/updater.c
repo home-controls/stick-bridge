@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/time.h>
 
 #include "esp_app_desc.h"
@@ -107,12 +108,44 @@ static const char *update_url(const bridge_settings_t *cfg) { return TEST_LOOP ?
 // short, and the cut request came back as a bogus status).
 #define URL_MAX 2048
 
+// Redirects follow the Location header exactly as the server sent it. esp_http_client_get_url() rebuilds an address
+// from scheme, host, port and path only and drops the query string, and GitHub's last hop is a signed
+// release-assets address whose signature is the query: without it the asset store answers HTTP 618 (what the
+// bridge kept seeing, while the same address worked from a browser).
+typedef struct {
+    char *buf;
+    size_t cap;
+} location_t;
+
+static esp_err_t on_http_event(esp_http_client_event_t *e) {
+    location_t *l = e->user_data;
+    if (l && e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && e->header_value && strcasecmp(e->header_key, "Location") == 0)
+        strlcpy(l->buf, e->header_value, l->cap);
+    return ESP_OK;
+}
+
+// The next address from a Location value: absolute as is, or "/path" on the current scheme and host. false when it is
+// neither or doesn't fit.
+static bool next_hop(const char *loc, char *url, size_t cap) {
+    if (strncmp(loc, "https://", 8) == 0 || strncmp(loc, "http://", 7) == 0) return strlcpy(url, loc, cap) < cap;
+    if (loc[0] != '/') return false;
+    const char *s = strstr(url, "://");
+    const char *end = s ? strchr(s + 3, '/') : NULL;
+    size_t base = end ? (size_t)(end - url) : strlen(url);
+    if (base + strlen(loc) + 1 > cap) return false;
+    strcpy(url + base, loc);
+    return true;
+}
+
 // Opens url and reads the response headers, following up to 4 redirects. Returns the client (the
 // caller cleans it up) with *status set, or NULL with *why set. Each hop gets a fresh client: one
 // reused after esp_http_client_set_redirection() read the new body wrongly.
 static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *len, const char **why) {
     char *next = malloc(URL_MAX);
-    if (!next) {
+    location_t loc = {.buf = malloc(URL_MAX), .cap = URL_MAX};
+    if (!next || !loc.buf) {
+        free(next);
+        free(loc.buf);
         *why = "out of memory";
         return NULL;
     }
@@ -129,7 +162,10 @@ static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *
             .buffer_size = 4096,     // a long Location header
             .buffer_size_tx = 2048,  // the long request line after the redirect
             .disable_auto_redirect = true,
+            .event_handler = on_http_event,
+            .user_data = &loc,
         };
+        loc.buf[0] = 0;
         esp_http_client_handle_t c = esp_http_client_init(&cfg);
         if (!c) {
             *why = "out of memory";
@@ -148,7 +184,7 @@ static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *
                 ret = c;
                 break;
             } else if (hop >= 4) *why = "too many redirects";
-            else if (esp_http_client_set_redirection(c) != ESP_OK || esp_http_client_get_url(c, next, URL_MAX) != ESP_OK)
+            else if (!loc.buf[0] || !next_hop(loc.buf, next, URL_MAX))
                 *why = "bad redirect";
             else if (!TEST_LOOP && strncmp(next, "https://", 8) != 0)
                 *why = "redirected to a plain http address";  // the whole chain stays https (test builds' local server aside)
@@ -161,6 +197,7 @@ static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *
         break;
     }
     free(next);
+    free(loc.buf);
     return ret;
 }
 

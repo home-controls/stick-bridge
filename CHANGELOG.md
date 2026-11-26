@@ -2,6 +2,10 @@
 
 Each version's notes are what the bridge shows before installing it, so keep them under 500 bytes.
 
+## 2.1.1
+
+Updates from GitHub work every time: the bridge rebuilt each redirect without its query string, which drops the signature of GitHub's signed download address, so the download server sometimes answered "HTTP 618". Redirects now follow the server's address exactly. A bridge on 2.1.0 or earlier that shows HTTP 618: check again, or install this release's .bin on System, Firmware.
+
 ## 2.1.0
 
 Security and robustness pass. Fixed a heap write from a crafted TI .hex, zip bombs and slow clients that froze the web server. The API token can't install firmware; logins lock out per address; first-boot setup only from the bridge's own address. Update sources must be https. A stuck stick no longer restarts the bridge. Thread RCP .gbl files flash on Thread radios. CI runs the tests on every push.
