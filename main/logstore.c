@@ -1,4 +1,5 @@
 #include "logstore.h"
+#include "tasks.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -310,7 +311,7 @@ void logstore_start(void) {
                  (unsigned long)(s_part->size / 1024), (esp_timer_get_time() - t0) / 1000);
     }
     // Without a flash area the writer still feeds the card (put() skips the flash part).
-    xTaskCreate(writer_task, "logstore", 8192, NULL, 2, NULL);
+    task_start(writer_task, "logstore", 6144, NULL, 2, false);  // writes the log partition
 }
 
 // The stamp of the first stamped line in the oldest stored text (0 if none).

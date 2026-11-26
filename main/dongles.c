@@ -12,6 +12,14 @@
 // rest on reports, not on a device we've seen.
 #define U "Strings unverified: identified by its USB name"
 static const dongle_model_t MODELS[] = {
+    // ---------------------------------------------------------------- Z-Wave (a radio for Z-Wave JS; bytes pass through)
+    // Before the SONOFF/CP2102N globs that share 10c4:ea60.
+    {"zooz_zst10_700", "Zooz ZST10 700", 0x10C4, 0xEA60, NULL, "*zst10*", "ZGM130S", FAM_ZWAVE, PROTO_ZWAVE, 115200, false,
+     RST_NONE, NULL, U},
+    {"zooz_zst39_800", "Zooz ZST39 800 LR", 0x1A86, 0x55D4, NULL, "*zst39*", "EFR32ZG23", FAM_ZWAVE, PROTO_ZWAVE, 115200,
+     false, RST_NONE, NULL, U},
+    {"aeotec_zstick", "Aeotec Z-Stick (7 / Gen5)", 0x0658, 0x0200, NULL, NULL, "ZGM130S", FAM_ZWAVE, PROTO_ZWAVE, 115200,
+     false, RST_NONE, NULL, "Sigma Designs USB ID shared by several Z-Wave sticks"},
     // ---------------------------------------------------------------- SONOFF
     {"sonoff_dongle-pmg24", "SONOFF Dongle Plus MG24", 0x10C4, 0xEA60, NULL, "*plus*mg24*", "EFR32MG24", FAM_SILABS,
      PROTO_EZSP, 115200, false, RST_RTS_DTR, "sonoff_dongle-pmg24", "Software flow control only (no RTS/CTS)"},
@@ -81,7 +89,7 @@ static const dongle_model_t MODELS[] = {
     // ---------------------------------------------------------------- Nordic / Espressif (native USB)
     {"nrf52840_dfu", "nRF52840 in its DFU bootloader", 0x1915, 0x521F, NULL, NULL, "nRF52840", FAM_NORDIC, PROTO_UNKNOWN,
      115200, false, RST_NRF_DFU, NULL, "In the bootloader: reset it to run its firmware"},
-    {"nrf52840", "nRF52840 dongle", 0x1915, 0, NULL, NULL, "nRF52840", FAM_NORDIC, PROTO_ZBOSS, 115200, false, RST_NRF_DFU,
+    {"nrf52840", "nRF52840 Dongle", 0x1915, 0, NULL, NULL, "nRF52840", FAM_NORDIC, PROTO_ZBOSS, 115200, false, RST_NRF_DFU,
      NULL, "ZBOSS is experimental in Zigbee2MQTT"},
     {"esp32_zboss", "ESP32-C6/H2 (USB serial)", 0x303A, 0x1001, NULL, NULL, "ESP32-C6/H2", FAM_ESP, PROTO_ZBOSS, 115200,
      false, RST_NONE, NULL, "Assumed ZBOSS NCP: any ESP32 with USB-serial looks the same"},
@@ -91,13 +99,13 @@ static const dongle_model_t MODELS[] = {
 // Generic entries when nothing in the table matches: we still drive the USB chip.
 static const dongle_model_t GENERIC[] = {
     {"generic_cp210x", "Unknown adapter (CP210x)", 0, 0, NULL, NULL, "", FAM_UNKNOWN, PROTO_UNKNOWN, 0, false, RST_NONE, NULL,
-     "Not in the dongle list: protocol is detected from the traffic"},
+     "Not in the stick list: protocol is detected from the traffic"},
     {"generic_ch34x", "Unknown adapter (CH340)", 0, 0, NULL, NULL, "", FAM_UNKNOWN, PROTO_UNKNOWN, 0, false, RST_NONE, NULL,
-     "Not in the dongle list: protocol is detected from the traffic"},
+     "Not in the stick list: protocol is detected from the traffic"},
     {"generic_ftdi", "Unknown adapter (FTDI)", 0, 0, NULL, NULL, "", FAM_UNKNOWN, PROTO_UNKNOWN, 0, false, RST_NONE, NULL,
-     "Not in the dongle list: protocol is detected from the traffic"},
+     "Not in the stick list: protocol is detected from the traffic"},
     {"generic_cdc", "Unknown adapter (USB CDC)", 0, 0, NULL, NULL, "", FAM_UNKNOWN, PROTO_UNKNOWN, 0, false, RST_NONE, NULL,
-     "Not in the dongle list: protocol is detected from the traffic"},
+     "Not in the stick list: protocol is detected from the traffic"},
     {"unsupported", "Unsupported USB device", 0, 0, NULL, NULL, "", FAM_UNKNOWN, PROTO_UNKNOWN, 0, false, RST_NONE, NULL,
      "Not a USB serial adapter the bridge can drive"},
 };
@@ -127,16 +135,21 @@ static int find_name(const char *const *names, int n, const char *s) {
     return -1;
 }
 int proto_from_name(const char *s) {
-    static const char *const N[] = {"unknown", "ezsp", "znp", "deconz", "zigate", "zboss", "spinel"};
-    return find_name(N, 7, s);
+    static const char *const N[] = {"unknown", "ezsp", "znp", "deconz", "zigate", "zboss", "spinel", "zwave"};
+    return find_name(N, 8, s);
 }
 int reset_from_name(const char *s) {
     static const char *const N[] = {"none", "rts_dtr", "slzb07_gpio", "baud_knock", "ti_sonoff", "ti_cc2538", "deconz", "nrf_dfu"};
     return find_name(N, 8, s);
 }
 int family_from_name(const char *s) {
-    static const char *const N[] = {"unknown", "silabs", "ti", "deconz", "nordic", "esp", "nxp"};
-    return find_name(N, 7, s);
+    static const char *const N[] = {"unknown", "silabs", "ti", "deconz", "nordic", "esp", "nxp", "zwave"};
+    return find_name(N, 8, s);
+}
+
+static bool model_fits(const dongle_model_t *m, uint16_t vid, uint16_t pid, const char *mfr, const char *both) {
+    return m->vid == vid && (!m->pid || m->pid == pid) && (!m->mfr || us_glob(m->mfr, mfr)) &&
+           (!m->product || us_glob(m->product, both));
 }
 
 const dongle_model_t *dongle_match(uint16_t vid, uint16_t pid, const char *mfr, const char *product, bool has_cdc) {
@@ -144,19 +157,10 @@ const dongle_model_t *dongle_match(uint16_t vid, uint16_t pid, const char *mfr, 
     snprintf(both, sizeof(both), "%s %s", mfr ? mfr : "", product ? product : "");
     const dongle_model_t *ex = s_extra;
     int nex = s_nextra;
-    for (int i = 0; ex && i < nex; i++) {
-        const dongle_model_t *m = &ex[i];
-        if (m->vid != vid || (m->pid && m->pid != pid)) continue;
-        if (m->mfr && !us_glob(m->mfr, mfr)) continue;
-        if (m->product && !us_glob(m->product, both)) continue;
-        return m;
-    }
-    for (const dongle_model_t *m = MODELS; m->id; m++) {
-        if (m->vid != vid || (m->pid && m->pid != pid)) continue;
-        if (m->mfr && !us_glob(m->mfr, mfr)) continue;
-        if (m->product && !us_glob(m->product, both)) continue;
-        return m;
-    }
+    for (int i = 0; ex && i < nex; i++)  // the downloaded list first
+        if (model_fits(&ex[i], vid, pid, mfr, both)) return &ex[i];
+    for (const dongle_model_t *m = MODELS; m->id; m++)
+        if (model_fits(m, vid, pid, mfr, both)) return m;
     switch (us_chip_for(vid, pid, has_cdc)) {
         case US_CP210X: return &GENERIC[0];
         case US_CH34X: return &GENERIC[1];
@@ -174,6 +178,7 @@ const char *proto_name(proto_t p) {
         case PROTO_ZIGATE: return "ZiGate";
         case PROTO_ZBOSS: return "ZBOSS";
         case PROTO_SPINEL: return "OpenThread RCP (Spinel)";
+        case PROTO_ZWAVE: return "Z-Wave Serial API";
         default: return "unknown";
     }
 }
@@ -210,6 +215,7 @@ const char *family_name(family_t f) {
         case FAM_NORDIC: return "Nordic";
         case FAM_ESP: return "Espressif";
         case FAM_NXP: return "NXP";
+        case FAM_ZWAVE: return "Z-Wave";
         default: return "unknown";
     }
 }

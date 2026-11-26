@@ -358,6 +358,8 @@ class Chip:
 # ---------------------------------------------------------------- driving the harness
 
 def wsl(p: Path) -> str:
+    if sys.platform != "win32":  # Linux (CI): run_all.py puts linux/wsl in front, paths stay as they are
+        return p.resolve().as_posix()
     s = str(p).replace("\\", "/")
     return f"/mnt/{s[0].lower()}{s[2:]}"
 
@@ -776,7 +778,7 @@ def main():
 
     # wrong entry patterns
     flash("SONOFF pattern on a direct-wired board: no bootloader", img, Chip(board="direct"), entry="sonoff",
-          expect_ok=False, err_has="No answer from the dongle's bootloader", extra=no_erase)
+          expect_ok=False, err_has="No answer from the stick's bootloader", extra=no_erase)
     flash("default pattern on a SONOFF board: no bootloader", img, Chip(), entry="default", expect_ok=False,
           err_has="No answer", extra=lambda r, d: no_erase(r, d) or (None if d.entries == 0 else "entered"))
     flash("default, wrong invert: no bootloader", img, Chip(board="direct"), entry="default", invert=True,
@@ -801,7 +803,7 @@ def main():
     flash("352 KB image on a 704 KB chip: refused before erasing", img, Chip(flash_size=K704), expect_ok=False,
           err_has="704 KB of flash", extra=no_erase)
     flash("image for another board's backdoor pin: refused", make_image(bl=bl_config(pin=13)), Chip(), expect_ok=False,
-          err_has="DIO13 active low but this dongle's is DIO15", extra=no_erase)
+          err_has="DIO13 active low but this stick's is DIO15", extra=no_erase)
     flash("... unless allowed", make_image(bl=bl_config(pin=13)), Chip(), allow_pin=True)
     flash("chip without MEMORY_READ: refused (size unknown)", img, Chip(mem_read_ok=False), expect_ok=False,
           err_has="flash size", extra=no_erase)

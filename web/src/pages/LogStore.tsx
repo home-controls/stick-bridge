@@ -2,7 +2,7 @@
 // goes, downloads, and a viewer for the newest part with search and a level filter.
 
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { api, post, toast } from "../store";
+import { api, post, toast, usePoll } from "../store";
 import { bytes, duration } from "../format";
 import type { LogsInfo } from "../types";
 import { Card, Chip, Empty, Seg } from "../ui";
@@ -24,14 +24,11 @@ export function LogStorage() {
   const [info, setInfo] = useState<LogsInfo | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [allFiles, setAllFiles] = useState(false);
+  const [formatting, setFormatting] = useState(false);
   const load = async () => {
     try { setInfo(await api<LogsInfo>("/api/logs")); setErr(null); } catch (e: any) { setErr(e.message); }
   };
-  useEffect(() => {
-    void load();
-    const t = setInterval(load, 10000);
-    return () => clearInterval(t);
-  }, []);
+  usePoll(load, 10000);
   const title = <><Icon name="logs" size={18} /> Log storage</>;
   if (!info) return <Card title={title} class="span-all">{err ? <p class="bad-text small">{err}</p> : <Empty>Loading…</Empty>}</Card>;
 
@@ -46,6 +43,17 @@ export function LogStorage() {
       body: "Everything stored in flash so far is hidden and its space reused. The live log and any files on the SD card stay." }))) return;
     try { await post("/api/logs/clear"); toast("Stored log cleared"); void load(); } catch (e: any) { toast(e.message, "error"); }
   };
+  const format = async () => {
+    if (!(await confirmIt({ title: "Format the SD card?", confirm: "Erase and format", danger: true,
+      body: "Everything on the card is erased: the stored day logs and any other files on it. The bridge then makes a fresh FAT file system and starts writing to it again. The log in flash isn't touched." }))) return;
+    setFormatting(true);
+    try { await post("/api/sd/format", { confirm: true }); toast("SD card formatted"); void load(); } catch (e: any) { toast(e.message, "error", 8000); }
+    finally { setFormatting(false); }
+  };
+  const canFormat = sd.state === "ok" || sd.state === "error";
+  const formatBtn = canFormat && (
+    <div class="row-btns"><button type="button" class="btn danger-text" disabled={formatting} onClick={format}><Icon name="trash" size={15} /> {formatting ? "Formatting…" : "Format card…"}</button></div>
+  );
   const files = sd.files ?? [];
   const shown = allFiles ? files : files.slice(0, 8);
   const sdPct = sd.total ? Math.min(100, ((sd.total - (sd.free ?? 0)) / sd.total) * 100) : 0;
@@ -85,9 +93,11 @@ export function LogStorage() {
               ))}
               {files.length > 8 && <li><button type="button" class="link-btn" onClick={() => setAllFiles(!allFiles)}>{allFiles ? "Fewer" : `All ${files.length} shown here`}</button></li>}
             </ul> : <p class="field-help">No files yet: the first lines go on the card within a few seconds.</p>}
+            {formatBtn}
           </> : <>
             {sd.state === "error" && <p class="bad-text small">{sd.detail}</p>}
-            <p class="field-help">Put a microSD card (FAT32) in the slot and the bridge also keeps one file per day on it, <span class="mono">zblog/2026-11-24.log</span>, deleting the oldest when it's nearly full. It's picked up within 30 s{sd.retry_in ? ` (next look in ${sd.retry_in} s)` : ""}. Cards over 32 GB usually come as exFAT: reformat them as FAT32.</p>
+            <p class="field-help">Put a microSD card (FAT32) in the slot and the bridge also keeps one file per day on it, <span class="mono">zblog/2026-11-24.log</span>, deleting the oldest when it's nearly full. It's picked up within 30 s{sd.retry_in ? ` (next look in ${sd.retry_in} s)` : ""}. Cards over 32 GB usually come as exFAT: reformat them as FAT32{canFormat ? " (Format card does that)" : ""}.</p>
+            {formatBtn}
           </>}
         </div>
       </div>

@@ -1,11 +1,13 @@
-// Network, Zigbee2MQTT connection, API access for Zigbee Studio, the admin password.
+// Radios (every stick's port, host, baud and role), network, radio 1's write pacing, firmware source, API access,
+// the admin password and updates.
 
 import { useEffect, useState } from "preact/hooks";
-import { auth, config, loadAuth, loadConfig, post, rebootNeeded, status, toast } from "../store";
+import { auth, config, loadAuth, loadConfig, post, rebootNeeded, toast } from "../store";
 import { Card, Field, Seg, copyText } from "../ui";
 import { Icon } from "../icons";
 import { confirmIt } from "../dialog";
 import type { Config } from "../types";
+import { Msg, RadiosSettingsCard } from "./Radios";
 
 function useDraft(): [Config | null, (p: Partial<Config>) => void, () => void] {
   const [d, setD] = useState<Config | null>(config.value);
@@ -13,9 +15,6 @@ function useDraft(): [Config | null, (p: Partial<Config>) => void, () => void] {
   return [d, (p) => setD((x) => (x ? { ...x, ...p } : x)), () => setD(config.value)];
 }
 
-function Msg({ m }: { m: { ok: boolean; text: string } | null }) {
-  return m ? <span class={`form-msg ${m.ok ? "ok" : "bad"}`}>{m.text}</span> : null;
-}
 
 async function save(patch: Partial<Config>, set: (m: { ok: boolean; text: string } | null) => void) {
   set(null);
@@ -60,48 +59,16 @@ function NetworkCard() {
   );
 }
 
-function Z2MCard() {
-  const [d, upd] = useDraft();
-  const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
-  if (!d || !config.value) return <Card title="Zigbee2MQTT"><p class="muted">Loading…</p></Card>;
-  const ip = config.value.mode === "static" ? config.value.ip : status.value?.eth.ip || location.hostname;
-  const thread = config.value.role === "thread";
-  const snippet = thread
-    ? `# Home Assistant: OpenThread Border Router add-on -> Configuration\n# device: leave any existing serial port selected (the add-on requires one)\nnetwork_device: ${ip}:${config.value.tcp_port}\nbaudrate: "${config.value.baud}"\nflow_control: false`
-    : `serial:\n  port: tcp://${ip}:${config.value.tcp_port}\n  adapter: ${status.value?.dongle.z2m_adapter || "ember"}\n  baudrate: ${config.value.baud}\n  rtscts: false`;
-  return (
-    <Card title={<><Icon name="link" size={18} /> Zigbee2MQTT</>}>
-      <form onSubmit={(e) => { e.preventDefault(); void save({ allow: d.allow.trim(), tcp_port: Number(d.tcp_port), baud: Number(d.baud) }, setM); }}>
-        <div class="form-grid two">
-          <span class="wide"><Field label="Allowed Zigbee2MQTT host" help="Only this IP (or a range like 192.168.1.0/24) may connect. Empty = anyone. Applies to the next connection; a client the new rule doesn't allow is dropped.">
-            <input value={d.allow} placeholder="192.168.1.10" onInput={(e) => upd({ allow: (e.target as HTMLInputElement).value })} /></Field></span>
-          <Field label="TCP port"><input type="number" min={1} max={65535} value={d.tcp_port} onInput={(e) => upd({ tcp_port: Number((e.target as HTMLInputElement).value) })} /></Field>
-          <Field label="Dongle baud rate">
-            <select value={String(d.baud)} onChange={(e) => upd({ baud: Number((e.target as HTMLSelectElement).value) })}>
-              {[115200, 230400, 460800, 921600].map((b) => <option value={b}>{b.toLocaleString()}</option>)}
-            </select>
-          </Field>
-        </div>
-        <div class="form-actions"><button class="btn primary">Save</button><Msg m={m} /></div>
-      </form>
-      <h4>{thread ? "Border router configuration" : "Zigbee2MQTT configuration"}</h4>
-      <pre class="snippet">{snippet}
-        <button type="button" class="icon-btn" title="Copy" aria-label="Copy" onClick={async () => toast((await copyText(snippet)) ? "Copied" : "Copy failed", "ok")}><Icon name="copy" size={16} /></button>
-      </pre>
-    </Card>
-  );
-}
-
 function PacingCard() {
   const [d, upd, reset] = useDraft();
   const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
-  if (!d || !config.value) return <Card title="Dongle pacing"><p class="muted">Loading…</p></Card>;
+  if (!d || !config.value) return <Card title="Radio 1 write pacing"><p class="muted">Loading…</p></Card>;
   if (d.tx_chunk === undefined) return null;  // firmware without pacing
   const baud = config.value.baud || 115200;
   const chunkMs = d.tx_chunk ? ((d.tx_chunk * 10 * 1000) / baud).toFixed(2) : null;
   return (
-    <Card title={<><Icon name="upload" size={18} /> Dongle pacing</>}>
-      <p class="muted small" style={{ marginTop: 0 }}>How Zigbee2MQTT's bytes go to the dongle. Applies at once, no reboot.</p>
+    <Card title={<><Icon name="upload" size={18} /> Radio 1 write pacing</>}>
+      <p class="muted small" style={{ marginTop: 0 }}>How the bridge writes radio 1's traffic to its stick: in small chunks with a short gap, so the stick's serial line keeps up with bursts from Zigbee2MQTT. The defaults suit most sticks. Applies at once, no reboot.</p>
       <form onSubmit={(e) => { e.preventDefault(); void save({ tx_chunk: Number(d.tx_chunk), tx_gap_us: Number(d.tx_gap_us), xoff_honor: !!d.xoff_honor, xoff_max_ms: Number(d.xoff_max_ms), ...(d.hw_flow === undefined ? {} : { hw_flow: !!d.hw_flow }) }, setM); }}>
         <div class="form-grid two">
           <Field label="USB chunk" help={chunkMs ? `${chunkMs} ms on the line at ${baud.toLocaleString()} baud` : "Each write goes out whole, as before 1.0.17"}>
@@ -112,14 +79,14 @@ function PacingCard() {
           <Field label="Gap between chunks (µs)" help="Idle line after the previous chunk has gone out. A lone frame isn't delayed.">
             <input type="number" min={0} max={5000} step={50} value={d.tx_gap_us} disabled={!d.tx_chunk} onInput={(e) => upd({ tx_gap_us: Number((e.target as HTMLInputElement).value) })} />
           </Field>
-          <Field label="XOFF from the dongle">
+          <Field label="XOFF from the stick">
             <Seg label="XOFF" value={d.xoff_honor ? "hold" : "count"} onChange={(v) => upd({ xoff_honor: v === "hold" })} options={[{ v: "hold", label: "Hold writes" }, { v: "count", label: "Count only" }]} />
           </Field>
           <Field label="Longest hold (ms)" help="Without an XON, writing resumes after this.">
             <input type="number" min={1} max={200} value={d.xoff_max_ms} disabled={!d.xoff_honor} onInput={(e) => upd({ xoff_max_ms: Number((e.target as HTMLInputElement).value) })} />
           </Field>
           {d.hw_flow !== undefined && (
-            <span class="wide"><Field label="Hardware flow control (CTS)" help="The USB chip stops sending while the dongle drops its RTS. Refused unless the dongle drives CTS now; turns itself off if a write stalls.">
+            <span class="wide"><Field label="Hardware flow control (CTS)" help="The USB chip stops sending while the stick drops its RTS. Refused unless the stick drives CTS now; turns itself off if a write stalls.">
               <Seg label="CTS" value={d.hw_flow ? "on" : "off"} onChange={(v) => upd({ hw_flow: v === "on" })} options={[{ v: "off", label: "Off" }, { v: "on", label: "Honour CTS" }]} />
             </Field></span>
           )}
@@ -134,31 +101,13 @@ function PacingCard() {
   );
 }
 
-function RoleCard() {
-  const [d, upd, reset] = useDraft();
-  const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
-  if (!d || !config.value || d.role === undefined) return null;
-  const proto = status.value?.dongle.protocol || "";
-  const mismatch = (d.role === "thread" && /EmberZNet|Z-Stack/.test(proto)) || (d.role === "zigbee" && /Spinel/.test(proto));
-  return (
-    <Card title={<><Icon name="coordinator" size={18} /> Dongle role</>}>
-      <p class="muted small" style={{ marginTop: 0 }}>What the dongle is for. It decides which firmware the bridge offers and accepts, how a flash is verified, and the configuration shown for the client. It doesn't flash anything by itself.</p>
-      <form onSubmit={(e) => { e.preventDefault(); void save({ role: d.role }, setM); }}>
-        <Seg label="Role" value={d.role} onChange={(v) => upd({ role: v })} options={[{ v: "zigbee", label: "Zigbee coordinator (Zigbee2MQTT)" }, { v: "thread", label: "Thread RCP (OpenThread Border Router)" }]} />
-        {mismatch && <p class="small warn-text" style={{ marginTop: "8px" }}><Icon name="alert" size={14} /> The dongle currently talks {proto}: flash {d.role === "thread" ? "an OpenThread RCP" : "a Zigbee coordinator"} build for this role (System → Dongle firmware).</p>}
-        <div class="form-actions"><button class="btn primary">Save</button><button type="button" class="btn" onClick={reset}>Undo changes</button><Msg m={m} /></div>
-      </form>
-    </Card>
-  );
-}
-
 function FirmwareSourceCard() {
   const [d, upd, reset] = useDraft();
   const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
   if (!d || !config.value || d.fw_repo === undefined) return null;
   return (
-    <Card title={<><Icon name="refresh" size={18} /> Dongle firmware source</>}>
-      <p class="muted small" style={{ marginTop: 0 }}>Where System → Dongle firmware looks for builds: a GitHub repo whose releases use silabs-firmware-builder's file names (yours, if you build your own).</p>
+    <Card title={<><Icon name="refresh" size={18} /> Silicon Labs firmware source</>}>
+      <p class="muted small" style={{ marginTop: 0 }}>Where System → Stick firmware looks for builds for Silicon Labs sticks (EFR32, like the MG21 and MG24): a GitHub repo whose releases use silabs-firmware-builder's file names (yours, if you build your own). TI sticks always use Koenkk/Z-Stack-firmware.</p>
       <form onSubmit={(e) => { e.preventDefault(); void save({ fw_repo: (d.fw_repo || "").trim(), fw_prerelease: !!d.fw_prerelease }, setM); }}>
         <div class="form-grid two">
           <Field label="GitHub repo (owner/name)"><input value={d.fw_repo} placeholder="Nerivec/silabs-firmware-builder" onInput={(e) => upd({ fw_repo: (e.target as HTMLInputElement).value })} /></Field>
@@ -265,12 +214,11 @@ export function Settings() {
   useEffect(() => { void loadConfig(); }, []);
   return (
     <div class="page">
-      <div class="page-head"><div><h1>Settings</h1><p class="lede">Saved on the bridge. The Zigbee2MQTT host applies at once; network, port and baud after a reboot.</p></div></div>
+      <div class="page-head"><div><h1>Settings</h1><p class="lede">Saved on the bridge. Radio settings and pacing apply at once; network settings and full-speed-only USB after a reboot.</p></div></div>
       <div class="cols-2">
+        <RadiosSettingsCard />
         <NetworkCard />
-        <Z2MCard />
         <PacingCard />
-        <RoleCard />
         <FirmwareSourceCard />
         <TokenCard />
         <PasswordCard />

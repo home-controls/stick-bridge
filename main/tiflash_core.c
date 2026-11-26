@@ -108,7 +108,7 @@ static const char *status_name(int st) {
         case RET_INVALID_ADR: return "invalid address";
         case RET_FLASH_FAIL: return "flash fail";
         case E_NOANSWER: return "no answer";
-        case E_GONE: return "dongle gone";
+        case E_GONE: return "stick gone";
         default: return "unexpected status";
     }
 }
@@ -130,7 +130,7 @@ const char *tf_image_check(const tf_io_t *io, uint32_t len, uint32_t chip_flash,
             return why;
         }
         if (len != chip_flash) {
-            snprintf(why, sizeof(why), "The image is %lu bytes but this chip's flash is %lu: wrong firmware for this dongle",
+            snprintf(why, sizeof(why), "The image is %lu bytes but this chip's flash is %lu: wrong firmware for this stick",
                      (unsigned long)len, (unsigned long)chip_flash);
             return why;
         }
@@ -158,13 +158,13 @@ const char *tf_image_check(const tf_io_t *io, uint32_t len, uint32_t chip_flash,
     g->image_valid = rd32le(c + TF_CCFG_IMAGE_VALID);
     if ((bl >> 24) != 0xC5) {
         snprintf(why, sizeof(why),
-                 "The image disables the ROM bootloader (CCFG BL_CONFIG 0x%08lx): the dongle couldn't be flashed again without a debugger",
+                 "The image disables the ROM bootloader (CCFG BL_CONFIG 0x%08lx): the stick couldn't be flashed again without a debugger",
                  (unsigned long)bl);
         return why;
     }
     if ((bl & 0xFF) != 0xC5) {
         snprintf(why, sizeof(why),
-                 "The image disables the bootloader backdoor (CCFG BL_CONFIG 0x%08lx): the dongle couldn't be flashed again without a debugger",
+                 "The image disables the bootloader backdoor (CCFG BL_CONFIG 0x%08lx): the stick couldn't be flashed again without a debugger",
                  (unsigned long)bl);
         return why;
     }
@@ -174,7 +174,7 @@ const char *tf_image_check(const tf_io_t *io, uint32_t len, uint32_t chip_flash,
         return why;
     }
     if ((g->erase_conf & 0x1) == 0) return "The image disables bank erase (CCFG ERASE_CONF): the bootloader couldn't erase it again";
-    if ((g->erase_conf & 0x100) == 0) return "The image disables chip erase (CCFG ERASE_CONF): a debugger couldn't recover the dongle";
+    if ((g->erase_conf & 0x100) == 0) return "The image disables chip erase (CCFG ERASE_CONF): a debugger couldn't recover the stick";
     uint32_t sectors = len / TF_SECTOR;
     for (uint32_t s = 0; s < sectors; s++) {
         uint32_t w = rd32le(c + TF_CCFG_PROT + (s / 32) * 4);
@@ -445,7 +445,7 @@ static bool erase(const tf_io_t *io, const tf_opts_t *o, tf_result_t *r, uint32_
             return true;
         }
         if (st == E_GONE) {
-            seterr(err, el, "The dongle went away during the erase");
+            seterr(err, el, "The stick went away during the erase");
             return false;
         }
         logf_(io, "Bank erase failed (%s): erasing sector by sector", status_name(st));
@@ -520,14 +520,14 @@ static bool write_image(const tf_io_t *io, tf_result_t *r, uint32_t len, char *e
                 if (need_dl) {
                     int st = download(io, r, off, run_end - off);
                     if (st != RET_SUCCESS) {
-                        if (st == E_GONE) seterr(err, el, "The dongle went away while writing (at 0x%05lx)", (unsigned long)off);
+                        if (st == E_GONE) seterr(err, el, "The stick went away while writing (at 0x%05lx)", (unsigned long)off);
                         else seterr(err, el, "The bootloader refused DOWNLOAD at 0x%05lx (%s)", (unsigned long)off, status_name(st));
                         return false;
                     }
                     need_dl = false;
                 }
                 if (send_packet(io, CMD_SEND_DATA, buf, padded) < 0) {
-                    seterr(err, el, "The dongle went away while writing (at 0x%05lx)", (unsigned long)off);
+                    seterr(err, el, "The stick went away while writing (at 0x%05lx)", (unsigned long)off);
                     return false;
                 }
                 int a = wait_ack(io, T_SEND_DATA);
@@ -547,7 +547,7 @@ static bool write_image(const tf_io_t *io, tf_result_t *r, uint32_t len, char *e
                     need_dl = true;
                 }
                 if (a == E_GONE || st == E_GONE) {
-                    seterr(err, el, "The dongle went away while writing (at 0x%05lx)", (unsigned long)off);
+                    seterr(err, el, "The stick went away while writing (at 0x%05lx)", (unsigned long)off);
                     return false;
                 }
                 r->retries++;
@@ -622,9 +622,9 @@ bool tf_flash(const tf_io_t *io, const tf_opts_t *o, tf_result_t *r, char *err, 
     }
     if (!synced) {
         if (o->entry == TF_ENTRY_NONE)
-            seterr(err, el, "No answer from the dongle's bootloader (hold its BOOT button while plugging it in, or pick a DTR/RTS method)");
+            seterr(err, el, "No answer from the stick's bootloader (hold its BOOT button while plugging it in, or pick a DTR/RTS method)");
         else
-            seterr(err, el, "No answer from the dongle's bootloader after the %s (wrong method for this dongle, or its firmware has the backdoor off)",
+            seterr(err, el, "No answer from the stick's bootloader after the %s (wrong method for this stick, or its firmware has the backdoor off)",
                    entry_name(o));
         return false;
     }
@@ -657,7 +657,7 @@ bool tf_flash(const tf_io_t *io, const tf_opts_t *o, tf_result_t *r, char *err, 
     logf_(io, "Chip id 0x%08lx, wafer 0x%04lx PG%u, %lu KB flash", (unsigned long)r->chip_id, (unsigned long)r->wafer_id,
           r->pg_rev, (unsigned long)(r->device_flash >> 10));
     if (r->device_flash && r->device_flash != len) {
-        seterr(err, el, "The chip has %lu KB of flash but the image is for %lu KB: wrong firmware for this dongle",
+        seterr(err, el, "The chip has %lu KB of flash but the image is for %lu KB: wrong firmware for this stick",
                (unsigned long)(r->device_flash >> 10), (unsigned long)(len >> 10));
         return false;
     }
@@ -672,7 +672,7 @@ bool tf_flash(const tf_io_t *io, const tf_opts_t *o, tf_result_t *r, char *err, 
         if (cur_on && (pin != r->image.bl_pin || lvl != r->image.bl_level)) {
             if (!o->allow_bl_pin_change) {
                 seterr(err, el,
-                       "The image's bootloader backdoor is DIO%u active %s but this dongle's is DIO%u active %s: firmware for another board "
+                       "The image's bootloader backdoor is DIO%u active %s but this stick's is DIO%u active %s: firmware for another board "
                        "(its button / DTR-RTS entry would stop working)",
                        r->image.bl_pin, r->image.bl_level ? "high" : "low", pin, lvl ? "high" : "low");
                 return false;
@@ -719,7 +719,7 @@ bool tf_flash(const tf_io_t *io, const tf_opts_t *o, tf_result_t *r, char *err, 
     progress(io, "reset", 0, 0);
     st = command(io, r, CMD_RESET, NULL, 0, T_ACK, NULL, 0, false);
     if (st != RET_SUCCESS) {
-        seterr(err, el, "Written and verified, but the bootloader didn't take RESET (%s): unplug and replug the dongle",
+        seterr(err, el, "Written and verified, but the bootloader didn't take RESET (%s): unplug and replug the stick",
                status_name(st));
         return false;
     }

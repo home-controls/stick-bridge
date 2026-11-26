@@ -419,6 +419,8 @@ class Dongle:
 # ---------------------------------------------------------------- driving the harness
 
 def wsl(p: Path) -> str:
+    if sys.platform != "win32":  # Linux (CI): run_all.py puts linux/wsl in front, paths stay as they are
+        return p.resolve().as_posix()
     s = str(p).replace("\\", "/")
     return f"/mnt/{s[0].lower()}{s[2:]}"
 
@@ -610,7 +612,7 @@ def main():
     flash("firmware hung: RTS/DTR reset", img, Dongle(app_answers=False),
           extra=lambda r, d: None if r["entered"] == "RTS/DTR reset" else r["entered"])
     flash("firmware hung, no RTS/DTR circuit", img, Dongle(app_answers=False, rtsdtr=False), expect_ok=False,
-          err_has="couldn't get the dongle into its bootloader",
+          err_has="couldn't get the stick into its bootloader",
           extra=lambda r, d: None if d.mode == "app" and d.received == b"" else "touched the dongle")
     flash("firmware refuses to start the bootloader, no RTS/DTR", img, Dongle(launch_ok=False, rtsdtr=False), expect_ok=False,
           err_has="bootloader", extra=lambda r, d: None if r["app_left_running"] and d.mode == "app" else r)

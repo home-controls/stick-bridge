@@ -1,6 +1,9 @@
 #include "stats.h"
 
+#include "settings.h"
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -10,9 +13,12 @@
 #include "freertos/semphr.h"
 
 bridge_stats_t g_stats;
+radio_stats_t g_radio[RADIO_MAX];
 
 static SemaphoreHandle_t s_lock;
-static hist_t s_hist[HIST_LEN];
+// The dashboard's rings and the device table live in PSRAM (internal RAM is what the watchdog guards); plain heap
+// on a board without it. Allocated once in stats_begin.
+static hist_t *s_hist;
 static int s_hist_head, s_hist_count;
 // 10-second points for 24 h, folded from the per-second ring (PSRAM; NULL without it)
 static hist_t *s_lhist;
@@ -21,11 +27,12 @@ static struct {
     uint32_t in, out, rx, ok, fail, cmds, err, n;
     uint64_t rtt_w;  // sum of rtt_avg_x10 * commands
     uint32_t rtt_cmds, rtt_max;
+    uint32_t r_in[RADIO_MAX], r_out[RADIO_MAX];
 } s_lacc;
-static event_t s_ev[EV_LEN];
+static event_t *s_ev;
 static int s_ev_head, s_ev_count;
 static uint32_t s_ev_next_id = 1;
-static zb_device_t s_dev[DEV_MAX];
+static zb_device_t *s_dev;
 static int s_dev_count;
 
 // Rolling windows for the health score (last 5 minutes, from history).
@@ -53,6 +60,10 @@ static void tick(void *arg) {
     uint32_t mx = g->acc_rtt_max / 100;
     h->rtt_max_x10 = mx > 0xFFFF ? 0xFFFF : mx;
     h->ash_err = g->acc_err;
+    for (int i = 0; i < RADIO_MAX; i++) {
+        h->r_in[i] = g_radio[i].acc_in > 0xFFFF ? 0xFFFF : (uint16_t)g_radio[i].acc_in;
+        h->r_out[i] = g_radio[i].acc_out > 0xFFFF ? 0xFFFF : (uint16_t)g_radio[i].acc_out;
+    }
     s_hist_head = (s_hist_head + 1) % HIST_LEN;
     if (s_hist_count < HIST_LEN) s_hist_count++;
     if (s_lhist) {
@@ -63,6 +74,10 @@ static void tick(void *arg) {
         s_lacc.fail += h->zb_tx_fail;
         s_lacc.cmds += h->ezsp_cmds;
         s_lacc.err += h->ash_err;
+        for (int i = 0; i < RADIO_MAX; i++) {
+            s_lacc.r_in[i] += h->r_in[i];
+            s_lacc.r_out[i] += h->r_out[i];
+        }
         s_lacc.n++;
         if (h->rtt_avg_x10) {
             uint32_t c = g->acc_rtt_n ? g->acc_rtt_n : 1;
@@ -85,6 +100,10 @@ static void tick(void *arg) {
             l->ash_err = CLAMP16(s_lacc.err);
             l->rtt_avg_x10 = s_lacc.rtt_cmds ? CLAMP16(s_lacc.rtt_w / s_lacc.rtt_cmds) : 0;
             l->rtt_max_x10 = CLAMP16(s_lacc.rtt_max);
+            for (int i = 0; i < RADIO_MAX; i++) {
+                l->r_in[i] = CLAMP16(s_lacc.r_in[i] / n);
+                l->r_out[i] = CLAMP16(s_lacc.r_out[i] / n);
+            }
 #undef CLAMP16
             s_lhist_head = (s_lhist_head + 1) % LHIST_LEN;
             if (s_lhist_count < LHIST_LEN) s_lhist_count++;
@@ -92,13 +111,29 @@ static void tick(void *arg) {
         }
     }
     g->acc_in = g->acc_out = g->acc_rx = g->acc_ok = g->acc_fail = g->acc_cmds = g->acc_err = 0;
+    for (int i = 0; i < RADIO_MAX; i++) {
+        radio_stats_t *r = &g_radio[i];
+        r->bps_in = r->acc_in;
+        r->bps_out = r->acc_out;
+        r->acc_in = r->acc_out = 0;
+    }
     g->acc_rtt_sum = 0;
     g->acc_rtt_n = g->acc_rtt_max = 0;
     stats_unlock();
 }
 
+static void *big(size_t n, size_t size) {
+    void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = calloc(n, size);
+    if (!p) abort();  // at boot: nothing works without these
+    return p;
+}
+
 void stats_begin(void) {
     s_lock = xSemaphoreCreateMutex();
+    s_hist = big(HIST_LEN, sizeof(hist_t));
+    s_ev = big(EV_LEN, sizeof(event_t));
+    s_dev = big(DEV_MAX, sizeof(zb_device_t));
     s_lhist = heap_caps_calloc(LHIST_LEN, sizeof(hist_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     memset(&g_stats, 0, sizeof(g_stats));
     const esp_timer_create_args_t args = {.callback = tick, .name = "stats_tick"};
@@ -107,23 +142,39 @@ void stats_begin(void) {
     esp_timer_start_periodic(t, 1000000);
 }
 
-void stats_event(ev_level_t level, const char *fmt, ...) {
+static void event_v(int radio, ev_level_t level, const char *fmt, va_list ap) {
     event_t e = {0};
     e.level = level;
     e.up_s = stats_uptime_s();
     struct timeval tv;
     gettimeofday(&tv, NULL);
     e.epoch = tv.tv_sec > 1700000000 ? tv.tv_sec : 0;
-    va_list ap;
-    va_start(ap, fmt);
     vsnprintf(e.text, sizeof(e.text), fmt, ap);
-    va_end(ap);
+    // "Radio 3: ..." / "Radio 3 firmware ..." belongs to radio 3 (index 2)
+    if (radio == -1 && strncmp(e.text, "Radio ", 6) == 0 && e.text[6] >= '1' && e.text[6] < '1' + RADIO_MAX &&
+        (e.text[7] == ':' || e.text[7] == ' ' || e.text[7] == 0))
+        radio = e.text[6] - '1';
+    e.radio = (int8_t)(radio >= 0 && radio < RADIO_MAX ? radio : -1);
     stats_lock();
     e.id = s_ev_next_id++;
     s_ev[s_ev_head] = e;
     s_ev_head = (s_ev_head + 1) % EV_LEN;
     if (s_ev_count < EV_LEN) s_ev_count++;
     stats_unlock();
+}
+
+void stats_event(ev_level_t level, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    event_v(-1, level, fmt, ap);
+    va_end(ap);
+}
+
+void stats_event_r(int radio, ev_level_t level, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    event_v(radio < 0 ? -2 : radio, level, fmt, ap);  // -2: explicitly the bridge, no prefix guessing
+    va_end(ap);
 }
 
 zb_device_t *stats_device(uint16_t short_id, bool create) {
@@ -177,6 +228,13 @@ void stats_reset_counters(void) {
     g->dropped_no_client = g->dropped_overflow = g->dongle_tx_errors = 0;
     g->dongle_attach = g->dongle_detach = 0;
     g->stats_since_s = stats_uptime_s();
+    for (int i = 0; i < RADIO_MAX; i++) {
+        radio_stats_t *r = &g_radio[i];
+        r->attach = r->detach = 0;
+        r->clients_accepted = r->clients_refused = r->client_drops = 0;
+        r->bytes_in = r->bytes_out = 0;
+        r->dropped_no_client = r->dropped_overflow = r->tx_errors = 0;
+    }
     s_dev_count = 0;
     s_hist_count = 0;
     s_hist_head = 0;
@@ -246,7 +304,15 @@ int stats_health(char *reason, int reason_len) {
     }
     bool dongle = g_stats.dongle_open, client = g_stats.client_connected, link = g_stats.eth_link;
     bool net_down = g_stats.network_up_known && !g_stats.network_up;
+    bool present[RADIO_MAX];
+    for (int i = 0; i < RADIO_MAX; i++) present[i] = g_radio[i].present;
     stats_unlock();
+    uint8_t role0 = settings_radio_role(0);
+    int missing = -1;  // the first set-up radio (2-4) whose stick is gone
+    for (int i = 1; i < RADIO_MAX && missing < 0; i++)
+        if (!present[i] && settings_radio_is_set_up(i)) missing = i;
+    static char missing_msg[48];
+    if (missing > 0) snprintf(missing_msg, sizeof(missing_msg), "Radio %d: stick missing", missing + 1);
 
     int score = 100;
     const char *why = "All good";
@@ -261,8 +327,12 @@ int stats_health(char *reason, int reason_len) {
         }                         \
     } while (0)
     if (!link) DEDUCT(100, "Ethernet link is down");
-    if (!dongle) DEDUCT(60, "Zigbee dongle not connected");
-    if (!client) DEDUCT(40, "Zigbee2MQTT not connected");
+    if (!dongle) DEDUCT(60, "Radio 1: no stick connected");
+    if (!client)
+        DEDUCT(40, role0 == RADIO_ROLE_THREAD  ? "Radio 1: border router not connected"
+                   : role0 == RADIO_ROLE_ZWAVE ? "Radio 1: Z-Wave JS not connected"
+                                               : "Zigbee2MQTT not connected");
+    if (missing > 0) DEDUCT(15, missing_msg);
     if (net_down) DEDUCT(50, "Coordinator reports the Zigbee network down");
     if (secs > 0) {
         uint32_t per_min = err * 60 / secs;

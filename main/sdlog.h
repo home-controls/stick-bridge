@@ -3,8 +3,8 @@
 //
 // Optional: with no card the bridge just keeps its flash log. A card is looked for at boot and every
 // 30 s, and is used as soon as one is in (no card-detect pin on this board, so a pulled card shows up
-// as a failed write or status check, and the bridge goes back to looking). The card is never formatted
-// by the bridge. When it's nearly full the oldest day files are deleted.
+// as a failed write or status check, and the bridge goes back to looking). The card is only formatted when
+// asked to (System page: sdlog_format). When it's nearly full the oldest day files are deleted.
 //
 // Board wiring (Waveshare ESP32-P4-ETH schematic): SDMMC 4-bit, CLK 43, CMD 44, D0-D3 39-42, card power
 // through a P-MOSFET on GPIO45 (low = on), and the pins' I/O bank (VDDPST_5) fed by the P4's LDO channel 4.
@@ -24,3 +24,6 @@ void sdlog_append(const char *text, size_t n, int64_t epoch_ms, uint32_t boot_no
 void sdlog_add_json(cJSON *root);
 // Streams one day file (name as listed) as text/plain.
 esp_err_t sdlog_send_file(httpd_req_t *req, const char *name, bool download);
+// Erases the card and makes a fresh FAT file system on it (FAT32 on cards over 2 GB), then logs to it again.
+// Works on a card in use and on one the bridge can't read ("isn't FAT32"). Everything on the card is lost.
+esp_err_t sdlog_format(char *err, size_t err_len);

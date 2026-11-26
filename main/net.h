@@ -7,3 +7,5 @@
 
 void net_start(const bridge_settings_t *cfg);
 bool net_has_ip(void);
+// The radios' ports changed (a radio came or went, or a port was edited): refresh the mDNS TXT record.
+void net_set_ports(void);

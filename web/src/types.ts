@@ -55,9 +55,43 @@ export interface Status {
     flow?: Flow;  // firmware 1.0.17+
     line?: Line;  // firmware 1.0.18+
   };
+  radios?: Radio[];  // 1.0.23+: the shown radios (2.0: radio 0 always, others while they have a stick or are set up)
 }
 
-/** USB OUT pacing + XON/XOFF from the dongle (txpace_core.c). */
+export type Role = "zigbee" | "zha" | "thread" | "zwave";  // zha: not on radio 0
+
+/** no_stick: radio 0 without a stick; missing: set up, its stick unplugged; opening; ready; flashing. */
+export type RadioState = "no_stick" | "missing" | "opening" | "ready" | "flashing";
+
+/** One shown radio (2.0): its stick on J3 or behind a hub, its TCP port and client. */
+export interface Radio {
+  index: number; state: RadioState; set_up: boolean; error: string; gen: number;
+  name: string; role: Role; tcp_port: number; allowed: string; baud: number;
+  stick: {
+    present: boolean; open: boolean; since: number;
+    usb_id?: string; manufacturer?: string; product?: string; serial?: string; usb_chip?: string; model?: string; model_name?: string;
+    family?: string; protocol?: string; protocol_detected?: boolean; z2m_adapter?: string; fw_running?: string; hub_port?: number;
+  };
+  /** The stick this radio keeps (the first one it saw); null = the next new stick takes it. */
+  saved_stick: { usb_id: string; serial: string; hub_port: number } | null;
+  client: { connected: boolean; ip: string; port: number; since: number };
+  counters: {
+    bytes_in: number; bytes_out: number; bps_in: number; bps_out: number;
+    clients_accepted: number; clients_refused: number; client_drops: number;
+    dropped_no_client: number; dropped_overflow: number; tx_errors: number; attach: number; detach: number;
+  };
+}
+
+/** GET /api/usb (1.0.23+): what is on J3. */
+export interface UsbState {
+  fs_only: boolean; fs_forced: boolean; reforces: number; refused: number; radio_max: number;
+  devices: { addr: number; hub_port: number; hub: boolean; speed: "high" | "full"; usb_id: string; product: string; radio: number | null }[];
+}
+
+/** A radio's link in /api/config (2.0: all four); radio 0's mirror the flat fields. `gen` goes back with a change. */
+export interface RadioLink { index: number; shown: boolean; set_up: boolean; gen: number; name: string; tcp_port: number; allow: string; baud: number; role: Role }
+
+/** USB OUT pacing + XON/XOFF from the stick (txpace_core.c). */
 export interface Flow {
   xon_rx: number; xoff_rx: number; xoff_now: boolean;
   xoff_pauses: number; xoff_timeouts: number; xoff_pause_avg_ms: number; xoff_pause_max_ms: number;
@@ -66,7 +100,7 @@ export interface Flow {
   chunk: number; gap_us: number; xoff_honor: boolean; xoff_max_ms: number;
 }
 
-/** The CP2102N's own view of the UART: CTS from the dongle, its error flags and queues (1.0.18+). */
+/** The CP2102N's own view of the UART: CTS from the stick, its error flags and queues (1.0.18+). */
 export interface Line {
   known: boolean; cts_now: boolean; hw_flow: boolean;
   samples: number; cts_off: number; cts_drops: number;
@@ -78,9 +112,12 @@ export interface Line {
 export interface History {
   t: number[]; in: number[]; out: number[]; rx: number[]; ok: number[]; fail: number[];
   cmds: number[]; rtt: number[]; rttmax: number[]; err: number[];
+  /** 2.0: bytes/s from / to each radio's stick (all four, aligned with t; radio 0's equal in/out). */
+  radios?: { in: number[]; out: number[] }[];
 }
 
-export interface BridgeEvent { id: number; up: number; epoch: number; level: 0 | 1 | 2; text: string }
+/** radio: 0-3 = the radio it is about, -1 = the bridge as a whole (2.0; missing before). */
+export interface BridgeEvent { id: number; up: number; epoch: number; level: 0 | 1 | 2; text: string; radio?: number }
 
 export interface ZbDevice {
   short: string; ieee: string; rx: number; tx_ok: number; tx_fail: number; route_err: number;
@@ -94,29 +131,32 @@ export interface Config {
   tx_chunk?: number; tx_gap_us?: number; xoff_honor?: boolean; xoff_max_ms?: number;  // 1.0.17+
   hw_flow?: boolean;  // 1.0.18+
   fw_repo?: string; fw_prerelease?: boolean;  // 1.0.19+
-  role?: "zigbee" | "thread";  // 1.0.20+
+  role?: Role;  // 1.0.20+ (zwave 1.0.23+)
+  usb_fs_only?: boolean;  // 1.0.23+
+  radios?: RadioLink[];  // 1.0.23+
 }
 
-/** GET /api/dongle: the Zigbee dongle's own firmware (a .gbl stored on the bridge, flashed on request). */
-/** GET /api/dongle -> catalog (1.0.19+): coordinator builds for this dongle on GitHub. */
+/** GET /api/dongle -> catalog (2.0: per radio): builds for that radio's stick on GitHub. */
 export interface FwCatalog {
-  checking: boolean; checked: number; checked_ago: number; error: string; repo: string; release: string; prerelease: boolean;
+  radio: number; checking: boolean; checked: number; checked_ago: number; error: string; repo: string; release: string; prerelease: boolean;
   board: string; model: string; current: string; type?: string;
   dongle_list?: { status: string; count: number; fetched_ago: number };
   builds: { name: string; version: string; sdk: string; baud: number; flow: string; size: number; sha256: string;
     usable: boolean; recommended: boolean; vs_current: "newer" | "same" | "older" | "unknown" }[];
-  download: { state: "idle" | "running" | "done" | "failed"; name: string; done: number; total: number; error: string };
+  download: { state: "idle" | "running" | "done" | "failed"; radio?: number; name: string; done: number; total: number; error: string };
 }
 
-/** GET /api/dongles: the dongles the bridge recognises. */
+/** GET /api/dongles: the sticks the bridge recognises. */
 export interface DongleModel {
   id: string; name: string; usb_id: string; usb_chip: string; radio: string; family: string; protocol: string; baud: number;
   rtscts_wired: boolean; bootloader_entry: string; flashable: boolean; note: string; downloaded?: boolean;
 }
 
+/** GET /api/dongle: the picked radio's stick firmware (an image stored on the bridge, flashed on request). */
 export interface DongleFw {
   catalog?: FwCatalog;
   max_size: number; baud: number; busy: boolean; dongle: boolean; z2m_connected: boolean;
+  radio?: number;  // 1.0.23+: the radio whose stick these pages work on
   current: string | null;
   image: null | {
     name: string; size: number; upload_size: number; md5: string; sha256: string; uploaded?: number;

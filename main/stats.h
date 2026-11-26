@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "radio_core.h"
+
 #define HIST_LEN 900  // seconds of per-second history
 #define LHIST_STEP 10   // seconds per point of the long history
 #define LHIST_LEN 8640  // 24 h of 10-second points (in PSRAM)
@@ -37,6 +39,7 @@ typedef struct {
     uint16_t zb_rx, zb_tx_ok, zb_tx_fail, ezsp_cmds;
     uint16_t rtt_avg_x10, rtt_max_x10;  // EZSP command round trip, ms * 10
     uint16_t ash_err;                // CRC + NAK + retransmit + cancel in that second
+    uint16_t r_in[RADIO_MAX], r_out[RADIO_MAX];  // every radio's bytes/s from / to its stick (radio 0's = bps_in/out)
 } hist_t;
 
 typedef struct {
@@ -44,6 +47,7 @@ typedef struct {
     uint32_t up_s;
     int64_t epoch;  // 0 until SNTP synced
     uint8_t level;
+    int8_t radio;  // the radio it is about (0 = radio 1), -1 = the bridge as a whole
     char text[112];
 } event_t;
 
@@ -68,7 +72,7 @@ typedef struct {
     uint8_t ezsp_version, stack_type;
     uint16_t stack_version;
     uint8_t last_reset_code, last_error_code;
-    uint32_t network_status;  // last stackStatusHandler status (0x90 up, 0x91 down)
+    uint32_t network_status;  // last stackStatusHandler status (EZSP v14+: 0x15 up, 0x16 down; older: 0x90, 0x91)
     bool network_up_known, network_up;
 
     // lifetime counters (since boot or the last reset)
@@ -94,13 +98,32 @@ typedef struct {
 
 extern bridge_stats_t g_stats;
 
+// Every radio's stick and client, for the radios list (radio 0's detail stays in g_stats above). Bytes are
+// counted by the bridge as they pass, whatever the protocol. Guarded by stats_lock().
+typedef struct {
+    bool present, open;
+    uint32_t since_s, attach, detach;
+    bool client_connected;
+    uint32_t client_ip;  // lwIP order
+    uint16_t client_port;
+    uint32_t client_since_s;
+    uint32_t clients_accepted, clients_refused, client_drops;
+    uint64_t bytes_in, bytes_out;  // from / to the stick
+    uint32_t dropped_no_client, dropped_overflow, tx_errors;
+    uint32_t bps_in, bps_out;  // the last full second
+    uint32_t acc_in, acc_out;
+} radio_stats_t;
+extern radio_stats_t g_radio[RADIO_MAX];
+
 void stats_begin(void);
 void stats_lock(void);
 void stats_unlock(void);
 uint32_t stats_uptime_s(void);
 
 // Takes the lock itself; do not call while holding it.
+// An event that starts "Radio N" is that radio's; stats_event_r names the radio explicitly (-1 = the bridge).
 void stats_event(ev_level_t level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void stats_event_r(int radio, ev_level_t level, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 // Caller holds the lock.
 zb_device_t *stats_device(uint16_t short_id, bool create);
 void stats_add_rtt(uint32_t us);

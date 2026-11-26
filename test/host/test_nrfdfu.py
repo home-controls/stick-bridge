@@ -559,6 +559,8 @@ class Dongle:
 # ---------------------------------------------------------------- driving the harness
 
 def wsl(p: Path) -> str:
+    if sys.platform != "win32":  # Linux (CI): run_all.py puts linux/wsl in front, paths stay as they are
+        return p.resolve().as_posix()
     s = str(p).replace("\\", "/")
     return f"/mnt/{s[0].lower()}{s[2:]}"
 

@@ -1,4 +1,5 @@
 #include "web.h"
+#include "tasks.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -8,8 +9,6 @@
 #include "cJSON.h"
 #include "dongle.h"
 #include "esp_app_desc.h"
-#include "esp_app_format.h"
-#include "esp_chip_info.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -184,10 +183,20 @@ static void note_login(bool ok) {
     }
 }
 
+// A good Basic header is remembered (as its SHA-256) for 10 minutes, so a Prometheus scrape or a script doesn't pay
+// the 4000-round PBKDF2 password check on every request. A password change forgets it.
+#define BASIC_CACHE_S 600
+static uint8_t s_basic_hash[32];
+static uint32_t s_basic_until_s, s_basic_gen;
+
 static bool check_basic(httpd_req_t *req) {
     char hdr[200];
     if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK) return false;
     if (strncmp(hdr, "Basic ", 6) != 0) return false;
+    uint8_t hh[32];
+    mbedtls_sha256((const unsigned char *)hdr, strlen(hdr), hh, 0);
+    uint32_t now = stats_uptime_s();
+    if (now < s_basic_until_s && s_basic_gen == settings_password_gen() && memcmp(hh, s_basic_hash, 32) == 0) return true;
     unsigned char dec[150];
     size_t dl = 0;
     if (mbedtls_base64_decode(dec, sizeof(dec) - 1, &dl, (const unsigned char *)hdr + 6, strlen(hdr + 6)) != 0)
@@ -199,6 +208,11 @@ static bool check_basic(httpd_req_t *req) {
     if (strcmp((char *)dec, "admin") != 0 || login_locked()) return false;
     bool ok = settings_check_password(colon + 1);
     note_login(ok);
+    if (ok) {
+        memcpy(s_basic_hash, hh, 32);
+        s_basic_gen = settings_password_gen();
+        s_basic_until_s = now + BASIC_CACHE_S;
+    }
     return ok;
 }
 
@@ -345,9 +359,34 @@ static void jw_printf(jw_t *w, const char *fmt, ...) {
     if (n > 0) jw_put(w, tmp, n < (int)sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1);
 }
 
+// An unsigned number, optionally with one decimal (x10 values), after an optional separator: the history answer is
+// tens of thousands of these, so no vsnprintf.
+static void jw_uint(jw_t *w, bool comma, uint32_t v, bool tenths) {
+    char b[16];
+    int i = sizeof(b);
+    if (tenths) {
+        b[--i] = (char)('0' + v % 10);
+        b[--i] = '.';
+        v /= 10;
+    }
+    do {
+        b[--i] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    if (comma) b[--i] = ',';
+    jw_put(w, b + i, sizeof(b) - i);
+}
+
 static void jw_str(jw_t *w, const char *s) {
     jw_put(w, "\"", 1);
     for (; *s; s++) {
+        size_t run = 0;  // characters that pass as they are, in one go
+        while (s[run] && s[run] != '"' && s[run] != '\\' && (unsigned char)s[run] >= 0x20 && s[run] != 0x7F) run++;
+        if (run) {
+            jw_put(w, s, run);
+            s += run;
+            if (!*s) break;
+        }
         unsigned char c = (unsigned char)*s;
         if (c == '"' || c == '\\') {
             char e[2] = {'\\', (char)c};
@@ -499,6 +538,111 @@ static void add_ash(cJSON *parent, const char *name, const ash_dir_stats_t *a) {
     cJSON_AddNumberToObject(o, "oversize", a->oversize);
 }
 
+// ---------------------------------------------------------------- radios
+
+static void add_usb_id(cJSON *o, const char *key, uint16_t vid, uint16_t pid) {
+    char vp[10];
+    snprintf(vp, sizeof(vp), "%04x:%04x", vid, pid);
+    cJSON_AddStringToObject(o, key, vp);
+}
+
+static const char *role_key(uint8_t r) {
+    return r == RADIO_ROLE_THREAD ? "thread" : r == RADIO_ROLE_ZWAVE ? "zwave" : r == RADIO_ROLE_ZHA ? "zha" : "zigbee";
+}
+
+static int role_from_key(const char *k) {
+    if (strcmp(k, "zigbee") == 0) return RADIO_ROLE_ZIGBEE;
+    if (strcmp(k, "zha") == 0) return RADIO_ROLE_ZHA;
+    if (strcmp(k, "thread") == 0) return RADIO_ROLE_THREAD;
+    if (strcmp(k, "zwave") == 0) return RADIO_ROLE_ZWAVE;
+    return -1;
+}
+
+// The shown radios (radio_core.h: radio 1, any with a stick, any set up), compactly: state, link settings, stick,
+// saved stick, client and byte counters.
+static void add_radios(cJSON *root, const bridge_settings_t *cfg) {
+    radio_stats_t rs[RADIO_MAX];
+    stats_lock();
+    memcpy(rs, g_radio, sizeof(rs));
+    stats_unlock();
+    radio_slot_t slots[RADIO_MAX];
+    settings_radio_slots(slots);
+    char ip[16], err[112];
+    cJSON *a = cJSON_AddArrayToObject(root, "radios");
+    for (int i = 0; i < RADIO_MAX; i++) {
+        const radio_link_t *l = &cfg->radios[i];
+        const radio_stats_t *st = &rs[i];
+        bool set_up = settings_radio_is_set_up(i), here = dx_identified(dongle_at(i));
+        radio_state_t state = radio_state(i, set_up, here, st->open, dx_claimed(dongle_at(i)));
+        if (state == RS_HIDDEN) continue;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "index", i);
+        cJSON_AddStringToObject(o, "state", radio_state_key(state));
+        cJSON_AddBoolToObject(o, "set_up", set_up);
+        dx_error(dongle_at(i), err, sizeof(err));
+        cJSON_AddStringToObject(o, "error", err);
+        cJSON_AddNumberToObject(o, "gen", cfg->gen[i]);
+        cJSON_AddStringToObject(o, "name", l->name[0] ? l->name : radio_role_name(l->role));
+        cJSON_AddStringToObject(o, "role", role_key(l->role));
+        cJSON_AddNumberToObject(o, "tcp_port", l->tcp_port);
+        cJSON_AddStringToObject(o, "allowed", l->allow);
+        cJSON_AddNumberToObject(o, "baud", l->baud);
+
+        dongle_info_t di;
+        dx_info(dongle_at(i), &di);
+        cJSON *k = cJSON_AddObjectToObject(o, "stick");
+        cJSON_AddBoolToObject(k, "present", here);
+        cJSON_AddBoolToObject(k, "open", st->open);
+        cJSON_AddNumberToObject(k, "since", st->since_s);
+        if (here) {
+            const dongle_model_t *m = di.model;
+            proto_t pr = di.proto_detected != PROTO_UNKNOWN ? di.proto_detected : m->proto;
+            add_usb_id(k, "usb_id", di.vid, di.pid);
+            cJSON_AddStringToObject(k, "manufacturer", di.mfr);
+            cJSON_AddStringToObject(k, "product", di.product);
+            cJSON_AddStringToObject(k, "serial", di.serial);
+            cJSON_AddStringToObject(k, "usb_chip", us_chip_name(di.chip));
+            cJSON_AddStringToObject(k, "model", m->id);
+            cJSON_AddStringToObject(k, "model_name", m->name);
+            cJSON_AddStringToObject(k, "family", family_name(m->family));
+            cJSON_AddStringToObject(k, "protocol", proto_name(pr));
+            cJSON_AddBoolToObject(k, "protocol_detected", di.proto_detected != PROTO_UNKNOWN);
+            cJSON_AddStringToObject(k, "z2m_adapter", proto_z2m_adapter(pr));
+            cJSON_AddStringToObject(k, "fw_running", di.fw_running);
+            cJSON_AddNumberToObject(k, "hub_port", di.hub_port);
+        }
+        const radio_ident_t *b = &slots[i].bound;
+        if (radio_ident_empty(b)) {
+            cJSON_AddNullToObject(o, "saved_stick");
+        } else {
+            cJSON *sb = cJSON_AddObjectToObject(o, "saved_stick");
+            add_usb_id(sb, "usb_id", b->vid, b->pid);
+            cJSON_AddStringToObject(sb, "serial", b->serial);
+            cJSON_AddNumberToObject(sb, "hub_port", b->port);
+        }
+        cJSON *c = cJSON_AddObjectToObject(o, "client");
+        cJSON_AddBoolToObject(c, "connected", st->client_connected);
+        ip_str(st->client_ip, ip);
+        cJSON_AddStringToObject(c, "ip", st->client_connected ? ip : "");
+        cJSON_AddNumberToObject(c, "port", st->client_port);
+        cJSON_AddNumberToObject(c, "since", st->client_since_s);
+        cJSON *n = cJSON_AddObjectToObject(o, "counters");
+        cJSON_AddNumberToObject(n, "bytes_in", (double)st->bytes_in);
+        cJSON_AddNumberToObject(n, "bytes_out", (double)st->bytes_out);
+        cJSON_AddNumberToObject(n, "bps_in", st->bps_in);
+        cJSON_AddNumberToObject(n, "bps_out", st->bps_out);
+        cJSON_AddNumberToObject(n, "clients_accepted", st->clients_accepted);
+        cJSON_AddNumberToObject(n, "clients_refused", st->clients_refused);
+        cJSON_AddNumberToObject(n, "client_drops", st->client_drops);
+        cJSON_AddNumberToObject(n, "dropped_no_client", st->dropped_no_client);
+        cJSON_AddNumberToObject(n, "dropped_overflow", st->dropped_overflow);
+        cJSON_AddNumberToObject(n, "tx_errors", st->tx_errors);
+        cJSON_AddNumberToObject(n, "attach", st->attach);
+        cJSON_AddNumberToObject(n, "detach", st->detach);
+        cJSON_AddItemToArray(a, o);
+    }
+}
+
 static esp_err_t h_status(httpd_req_t *req) {
     REQUIRE_AUTH(req);
     bridge_settings_t cfg;
@@ -548,9 +692,7 @@ static esp_err_t h_status(httpd_req_t *req) {
     cJSON *d = cJSON_AddObjectToObject(r, "dongle");
     cJSON_AddBoolToObject(d, "present", g.dongle_present);
     cJSON_AddBoolToObject(d, "open", g.dongle_open);
-    char vp[10];
-    snprintf(vp, sizeof(vp), "%04x:%04x", g.dongle_vid, g.dongle_pid);
-    cJSON_AddStringToObject(d, "usb_id", vp);
+    add_usb_id(d, "usb_id", g.dongle_vid, g.dongle_pid);
     cJSON_AddStringToObject(d, "manufacturer", g.dongle_mfr);
     cJSON_AddStringToObject(d, "product", g.dongle_product);
     cJSON_AddStringToObject(d, "serial", g.dongle_serial);
@@ -675,6 +817,7 @@ static esp_err_t h_status(httpd_req_t *req) {
     cJSON_AddNumberToObject(k, "dongle_tx_errors", g.dongle_tx_errors);
     cJSON_AddNumberToObject(k, "dongle_attach", g.dongle_attach);
     cJSON_AddNumberToObject(k, "dongle_detach", g.dongle_detach);
+    add_radios(r, &cfg);
     return send_json(req, r);
 }
 
@@ -704,23 +847,33 @@ static esp_err_t h_history(httpd_req_t *req) {
         jw_printf(w, "%s\"%s\":[", k ? "," : "", names[k]);
         for (int i = 0; i < n && w->err == ESP_OK; i++) {
             const hist_t *h = &hs[i];
-            const char *sep = i ? "," : "";
+            uint32_t v;
             switch (k) {
-                case 0: jw_printf(w, "%s%lu", sep, (unsigned long)h->t); break;
-                case 1: jw_printf(w, "%s%u", sep, h->bps_in); break;
-                case 2: jw_printf(w, "%s%u", sep, h->bps_out); break;
-                case 3: jw_printf(w, "%s%u", sep, h->zb_rx); break;
-                case 4: jw_printf(w, "%s%u", sep, h->zb_tx_ok); break;
-                case 5: jw_printf(w, "%s%u", sep, h->zb_tx_fail); break;
-                case 6: jw_printf(w, "%s%u", sep, h->ezsp_cmds); break;
-                case 7: jw_printf(w, "%s%u.%u", sep, h->rtt_avg_x10 / 10, h->rtt_avg_x10 % 10); break;
-                case 8: jw_printf(w, "%s%u.%u", sep, h->rtt_max_x10 / 10, h->rtt_max_x10 % 10); break;
-                default: jw_printf(w, "%s%u", sep, h->ash_err); break;
+                case 0: v = h->t; break;
+                case 1: v = h->bps_in; break;
+                case 2: v = h->bps_out; break;
+                case 3: v = h->zb_rx; break;
+                case 4: v = h->zb_tx_ok; break;
+                case 5: v = h->zb_tx_fail; break;
+                case 6: v = h->ezsp_cmds; break;
+                case 7: v = h->rtt_avg_x10; break;
+                case 8: v = h->rtt_max_x10; break;
+                default: v = h->ash_err; break;
             }
+            jw_uint(w, i > 0, v, k == 7 || k == 8);
         }
         jw_put(w, "]", 1);
     }
-    jw_put(w, "}", 1);
+    // radios: every radio's bytes/s from / to its stick, same points as t (the dashboard shows the ones in use)
+    jw_put(w, ",\"radios\":[", 11);
+    for (int r = 0; r < RADIO_MAX && w->err == ESP_OK; r++) {
+        jw_put(w, r ? ",{\"in\":[" : "{\"in\":[", r ? 8 : 7);
+        for (int i = 0; i < n; i++) jw_uint(w, i > 0, hs[i].r_in[r], false);
+        jw_put(w, "],\"out\":[", 9);
+        for (int i = 0; i < n; i++) jw_uint(w, i > 0, hs[i].r_out[r], false);
+        jw_put(w, "]}", 2);
+    }
+    jw_put(w, "]}", 2);
     free(hs);
     esp_err_t e = jw_end(w);
     free(w);
@@ -728,7 +881,7 @@ static esp_err_t h_history(httpd_req_t *req) {
 }
 
 static uint32_t query_u32(httpd_req_t *req, const char *key) {
-    char q[64], v[16];
+    char q[200], v[16];  // room for every query this API takes (a 64-byte buffer silently lost long ones)
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) return 0;
     if (httpd_query_key_value(q, key, v, sizeof(v)) != ESP_OK) return 0;
     return strtoul(v, NULL, 10);
@@ -748,8 +901,8 @@ static esp_err_t h_events(httpd_req_t *req) {
     jw_begin(w, req);
     jw_put(w, "{\"events\":[", 11);
     for (int i = 0; i < n; i++) {
-        jw_printf(w, "%s{\"id\":%lu,\"up\":%lu,\"epoch\":%lld,\"level\":%u,\"text\":", i ? "," : "",
-                  (unsigned long)ev[i].id, (unsigned long)ev[i].up_s, (long long)ev[i].epoch, ev[i].level);
+        jw_printf(w, "%s{\"id\":%lu,\"up\":%lu,\"epoch\":%lld,\"level\":%u,\"radio\":%d,\"text\":", i ? "," : "",
+                  (unsigned long)ev[i].id, (unsigned long)ev[i].up_s, (long long)ev[i].epoch, ev[i].level, ev[i].radio);
         jw_str(w, ev[i].text);
         jw_put(w, "}", 1);
     }
@@ -877,9 +1030,28 @@ static cJSON *config_json(void) {
     cJSON_AddBoolToObject(r, "hw_flow", c.hw_flow);
     cJSON_AddStringToObject(r, "fw_repo", c.fw_repo);
     cJSON_AddBoolToObject(r, "fw_prerelease", c.fw_prerelease);
-    cJSON_AddStringToObject(r, "role", c.role == BRIDGE_ROLE_THREAD ? "thread" : "zigbee");
+    cJSON_AddStringToObject(r, "role", role_key(c.role));
     cJSON_AddStringToObject(r, "update_url", c.update_url);
     cJSON_AddBoolToObject(r, "update_auto", c.update_auto);
+    cJSON_AddBoolToObject(r, "usb_fs_only", c.usb_fs_only);
+    // Every radio's link; radio 0's port/host/baud/role are the flat fields above (either may be posted). shown:
+    // the dashboard edits those; gen: post it back, so an edit made before a stick took or left the radio is refused.
+    cJSON *a = cJSON_AddArrayToObject(r, "radios");
+    uint32_t shown = settings_radio_shown_mask();
+    for (int i = 0; i < RADIO_MAX; i++) {
+        const radio_link_t *l = &c.radios[i];
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "index", i);
+        cJSON_AddBoolToObject(o, "shown", (shown >> i) & 1u);
+        cJSON_AddBoolToObject(o, "set_up", settings_radio_is_set_up(i));
+        cJSON_AddNumberToObject(o, "gen", c.gen[i]);
+        cJSON_AddStringToObject(o, "name", l->name);
+        cJSON_AddNumberToObject(o, "tcp_port", l->tcp_port);
+        cJSON_AddStringToObject(o, "allow", l->allow);
+        cJSON_AddNumberToObject(o, "baud", l->baud);
+        cJSON_AddStringToObject(o, "role", role_key(l->role));
+        cJSON_AddItemToArray(a, o);
+    }
     return r;
 }
 
@@ -923,7 +1095,7 @@ static esp_err_t h_config_post(httpd_req_t *req) {
     if (!bad && !(get_ip(j, "ip", &c.ip) && get_ip(j, "mask", &c.mask) && get_ip(j, "gw", &c.gw) && get_ip(j, "dns", &c.dns)))
         bad = "An IP address field is not a valid IPv4 address";
     if (!bad && (v = cJSON_GetObjectItem(j, "allow"))) {
-        if (!cJSON_IsString(v) || strlen(v->valuestring) >= sizeof(c.allow)) bad = "Z2M host: use a.b.c.d, a.b.c.d/nn or leave empty";
+        if (!cJSON_IsString(v) || strlen(v->valuestring) >= sizeof(c.allow)) bad = "Radio 1 allowed host: use a.b.c.d, a.b.c.d/nn or leave empty";
         else strlcpy(c.allow, v->valuestring, sizeof(c.allow));
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "tcp_port"))) {
@@ -967,8 +1139,61 @@ static esp_err_t h_config_post(httpd_req_t *req) {
         else strlcpy(c.fw_repo, v->valuestring, sizeof(c.fw_repo));
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "role"))) {
-        if (!cJSON_IsString(v) || (strcmp(v->valuestring, "zigbee") && strcmp(v->valuestring, "thread"))) bad = "role is zigbee or thread";
-        else c.role = strcmp(v->valuestring, "thread") == 0 ? BRIDGE_ROLE_THREAD : BRIDGE_ROLE_ZIGBEE;
+        if (!cJSON_IsString(v) || role_from_key(v->valuestring) < 0) bad = "role is zigbee, zha, thread or zwave";
+        else c.role = (uint8_t)role_from_key(v->valuestring);
+    }
+    if (!bad && (v = cJSON_GetObjectItem(j, "usb_fs_only"))) {
+        if (!cJSON_IsBool(v)) bad = "usb_fs_only is true or false";
+        else c.usb_fs_only = cJSON_IsTrue(v);
+    }
+    // radios: [{index, gen?, name?, tcp_port?, allow?, baud?, role?}, ...]; radio 0's go to the flat fields. A gen
+    // that isn't the radio's current one means a stick took or left it since the page loaded: refused.
+    static char gone[96];
+    if (!bad && (v = cJSON_GetObjectItem(j, "radios"))) {
+        if (!cJSON_IsArray(v)) bad = "radios is a list";
+        const cJSON *o;
+        cJSON_ArrayForEach(o, v) {
+            if (bad) break;
+            const cJSON *ix = cJSON_GetObjectItem(o, "index"), *f;
+            if (!cJSON_IsNumber(ix) || ix->valuedouble != (int)ix->valuedouble || ix->valueint < 0 || ix->valueint >= RADIO_MAX) {
+                snprintf(gone, sizeof(gone), "radios: each entry needs an index 0-%d", RADIO_MAX - 1);
+                bad = gone;
+                break;
+            }
+            int i = ix->valueint;
+            radio_link_t *l = &c.radios[i];
+            if ((f = cJSON_GetObjectItem(o, "gen")) && (!cJSON_IsNumber(f) || (uint32_t)f->valuedouble != c.gen[i])) {
+                snprintf(gone, sizeof(gone), "Radio %d changed meanwhile (a stick was plugged in or out): reload the page", i + 1);
+                bad = gone;
+                break;
+            }
+            if (!bad && (f = cJSON_GetObjectItem(o, "name"))) {
+                if (!cJSON_IsString(f) || strlen(f->valuestring) >= sizeof(l->name)) bad = "radios: name up to 15 characters";
+                else strlcpy(l->name, f->valuestring, sizeof(l->name));
+            }
+            if (!bad && (f = cJSON_GetObjectItem(o, "tcp_port"))) {
+                if (!cJSON_IsNumber(f) || f->valuedouble < 1 || f->valuedouble > 65535 || f->valuedouble != (int)f->valuedouble)
+                    bad = "radios: TCP port must be 1-65535 and not 80";
+                else if (i == 0) c.tcp_port = (uint16_t)f->valueint;
+                else l->tcp_port = (uint16_t)f->valueint;
+            }
+            if (!bad && (f = cJSON_GetObjectItem(o, "allow"))) {
+                if (!cJSON_IsString(f) || strlen(f->valuestring) >= sizeof(l->allow)) bad = "radios: allowed host: use a.b.c.d, a.b.c.d/nn or leave empty";
+                else if (i == 0) strlcpy(c.allow, f->valuestring, sizeof(c.allow));
+                else strlcpy(l->allow, f->valuestring, sizeof(l->allow));
+            }
+            if (!bad && (f = cJSON_GetObjectItem(o, "baud"))) {
+                if (!cJSON_IsNumber(f) || f->valuedouble < 9600 || f->valuedouble > 921600 || f->valuedouble != (int)f->valuedouble)
+                    bad = "radios: baud rate must be 9600-921600";
+                else if (i == 0) c.baud = (uint32_t)f->valuedouble;
+                else l->baud = (uint32_t)f->valuedouble;
+            }
+            if (!bad && (f = cJSON_GetObjectItem(o, "role"))) {
+                if (!cJSON_IsString(f) || role_from_key(f->valuestring) < 0) bad = "radios: role is zigbee, zha, thread or zwave";
+                else if (i == 0) c.role = (uint8_t)role_from_key(f->valuestring);
+                else l->role = (uint8_t)role_from_key(f->valuestring);
+            }
+        }
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "fw_prerelease"))) {
         if (!cJSON_IsBool(v)) bad = "fw_prerelease is true or false";
@@ -979,11 +1204,18 @@ static esp_err_t h_config_post(httpd_req_t *req) {
         else c.hw_flow = cJSON_IsTrue(v);
     }
     cJSON_Delete(j);
-    if (bad) return send_error(req, "400 Bad Request", bad);
+    if (bad) return send_error(req, bad == gone && strstr(gone, "meanwhile") ? "409 Conflict" : "400 Bad Request", bad);
     bool reboot = false;
-    char err[96] = "";
-    if (c.role != old.role)
-        stats_event(EV_INFO, "Dongle role set to %s", c.role == BRIDGE_ROLE_THREAD ? "Thread RCP (OpenThread Border Router)" : "Zigbee coordinator (Zigbee2MQTT)");
+    char err[112] = "";
+    // A port or baud change waits while that radio's stick is being flashed (the flasher owns its line).
+    for (int i = 0; i < RADIO_MAX; i++) {
+        uint16_t np = i == 0 ? c.tcp_port : c.radios[i].tcp_port, op = i == 0 ? old.tcp_port : old.radios[i].tcp_port;
+        uint32_t nb = i == 0 ? c.baud : c.radios[i].baud, ob = i == 0 ? old.baud : old.radios[i].baud;
+        if ((np != op || nb != ob) && dx_claimed(dongle_at(i))) {
+            snprintf(err, sizeof(err), "Radio %d's stick is being flashed: change its port or baud afterwards", i + 1);
+            return send_error(req, "409 Conflict", err);
+        }
+    }
     if (c.hw_flow != old.hw_flow) {
         // Applied before saving: a refusal (dongle not driving CTS) saves nothing.
         if (dongle_set_hw_flow(c.hw_flow, err, sizeof(err)) != ESP_OK && c.hw_flow) {
@@ -994,22 +1226,38 @@ static esp_err_t h_config_post(httpd_req_t *req) {
         stats_event(EV_INFO, "Hardware flow control (CTS) %s", c.hw_flow ? "on" : "off");
     }
     if (settings_save(&c, &reboot, err, sizeof(err)) != ESP_OK) return send_error(req, "400 Bad Request", err);
+    bridge_settings_t now;
+    settings_get(&now);  // what was saved (a radio a stick took meanwhile kept its own link)
     if (c.tx_chunk != old.tx_chunk || c.tx_gap_us != old.tx_gap_us || c.xoff_honor != old.xoff_honor ||
         c.xoff_max_ms != old.xoff_max_ms) {
         dongle_set_flow(c.tx_chunk, c.tx_gap_us, c.xoff_honor, c.xoff_max_ms);
-        stats_event(EV_INFO, "Dongle pacing set: chunk %u, gap %u us, XOFF %s (max %u ms)", c.tx_chunk,
+        stats_event(EV_INFO, "Radio 1 pacing set: chunk %u, gap %u us, XOFF %s (max %u ms)", c.tx_chunk,
                     c.tx_gap_us, c.xoff_honor ? "honoured" : "counted only", c.xoff_max_ms);
     }
-    if (strcmp(old.allow, c.allow) != 0) {
-        stats_event(EV_INFO, "Z2M host set to '%s'", c.allow[0] ? c.allow : "anyone");
-        // Drop a client the new rule no longer allows.
-        stats_lock();
-        bool conn = g_stats.client_connected;
-        uint32_t cip = g_stats.client_ip;
-        stats_unlock();
-        if (conn && !settings_allow_peer(cip)) bridge_kick_client("no longer allowed by the Z2M host setting");
+    // Radio links apply live: the radio's task rebinds a new port by itself; a new baud switches the stick now and
+    // its client reconnects; a host the new rule doesn't allow is dropped; a new role drops the firmware check.
+    for (int i = 0; i < RADIO_MAX; i++) {
+        const radio_link_t *n = &now.radios[i], *o = &old.radios[i];
+        unsigned d = radio_link_diff(o, n);
+        if (!d) continue;
+        if (d & (RL_NAME | RL_ROLE | RL_PORT | RL_BAUD))
+            stats_event(EV_INFO, "Radio %d set: %s, %s, TCP %u, %lu baud", i + 1, n->name[0] ? n->name : radio_role_name(n->role),
+                        radio_role_name(n->role), n->tcp_port, (unsigned long)n->baud);
+        if (d & RL_BAUD) {
+            if (dx_set_link_baud(dongle_at(i), n->baud) == ESP_OK && dx_ready(dongle_at(i)))
+                bridge_kick_radio(i, "the radio's baud rate changed");
+        }
+        if (d & RL_ROLE) fwcat_forget(i);
+        if (d & RL_ALLOW) {
+            stats_event(EV_INFO, "Radio %d allowed host set to '%s'", i + 1, n->allow[0] ? n->allow : "anyone");
+            stats_lock();
+            bool conn = g_radio[i].client_connected;
+            uint32_t cip = g_radio[i].client_ip;
+            stats_unlock();
+            if (conn && !settings_allow_peer_radio(i, cip)) bridge_kick_radio(i, "no longer allowed by the radio's host setting");
+        }
     }
-    if (reboot) stats_event(EV_INFO, "Network/port/baud settings saved; reboot to apply");
+    if (reboot) stats_event(EV_INFO, "Network settings saved; reboot to apply");
     cJSON *r = config_json();
     cJSON_AddBoolToObject(r, "reboot_required", reboot);
     return send_json(req, r);
@@ -1074,7 +1322,7 @@ static esp_err_t h_update_check(httpd_req_t *req) {
 
 static esp_err_t h_update_install(httpd_req_t *req) {
     REQUIRE_CHANGE(req);
-    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The dongle's firmware is being flashed: wait for it to finish");
+    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The stick's firmware is being flashed: wait for it to finish");
     char why[80];
     if (!updater_install(why, sizeof(why))) return send_error(req, "409 Conflict", why);
     return send_ok(req);
@@ -1082,7 +1330,7 @@ static esp_err_t h_update_install(httpd_req_t *req) {
 
 static esp_err_t h_reboot(httpd_req_t *req) {
     REQUIRE_CHANGE(req);
-    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The dongle's firmware is being flashed: wait for it to finish");
+    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The stick's firmware is being flashed: wait for it to finish");
     stats_event(EV_INFO, "Reboot requested from the dashboard");
     schedule_reboot(800);
     return send_ok(req);
@@ -1097,7 +1345,7 @@ static esp_err_t h_stats_reset(httpd_req_t *req) {
 
 static esp_err_t h_factory(httpd_req_t *req) {
     REQUIRE_SESSION(req);
-    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The dongle's firmware is being flashed: wait for it to finish");
+    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The stick's firmware is being flashed: wait for it to finish");
     cJSON *j = read_json(req);
     const cJSON *c = j ? cJSON_GetObjectItem(j, "confirm") : NULL;
     bool ok = cJSON_IsString(c) && strcmp(c->valuestring, "RESET") == 0;
@@ -1112,7 +1360,7 @@ static esp_err_t h_factory(httpd_req_t *req) {
 
 static esp_err_t h_ota(httpd_req_t *req) {
     REQUIRE_CHANGE(req);
-    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The dongle's firmware is being flashed: wait for it to finish");
+    if (ncpflash_busy()) return send_error(req, "409 Conflict", "The stick's firmware is being flashed: wait for it to finish");
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     int total = req->content_len;
     if (part == NULL) return send_error(req, "500 Internal Server Error", "no OTA partition");
@@ -1198,9 +1446,27 @@ static esp_err_t send_dongle_state(httpd_req_t *req) {
     cJSON *r = cJSON_CreateObject();
     ncpflash_add_json(r);
     cJSON *d = cJSON_DetachItemFromObject(r, "dongle_fw");
-    if (d) fwcat_add_json(d);
+    if (d) fwcat_add_json(d, dongle_fl_index());
     cJSON_Delete(r);
     return d ? send_json(req, d) : send_error(req, "500 Internal Server Error", "out of memory");
+}
+
+static void add_model(cJSON *a, const dongle_model_t *m, bool downloaded) {
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "id", m->id);
+    cJSON_AddStringToObject(o, "name", m->name);
+    add_usb_id(o, "usb_id", m->vid, m->pid);
+    cJSON_AddStringToObject(o, "usb_chip", us_chip_name(us_chip_for(m->vid, m->pid, true)));
+    cJSON_AddStringToObject(o, "radio", m->radio);
+    cJSON_AddStringToObject(o, "family", family_name(m->family));
+    cJSON_AddStringToObject(o, "protocol", proto_name(m->proto));
+    cJSON_AddNumberToObject(o, "baud", m->baud);
+    cJSON_AddBoolToObject(o, "rtscts_wired", m->hw_flow);
+    cJSON_AddStringToObject(o, "bootloader_entry", reset_name(m->reset));
+    cJSON_AddBoolToObject(o, "flashable", m->family == FAM_SILABS);
+    cJSON_AddStringToObject(o, "note", m->note ? m->note : "");
+    if (downloaded) cJSON_AddBoolToObject(o, "downloaded", true);
+    cJSON_AddItemToArray(a, o);
 }
 
 // The dongles the bridge knows (static table).
@@ -1210,52 +1476,112 @@ static esp_err_t h_dongles(httpd_req_t *req) {
     const char *last = "";
     const dongle_model_t *ex = dongles_extra();
     int nex = dongles_extra_count();
-    for (int i = 0; ex && i < nex; i++) {
-        const dongle_model_t *m = &ex[i];
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "id", m->id);
-        cJSON_AddStringToObject(o, "name", m->name);
-        char vp[10];
-        snprintf(vp, sizeof(vp), "%04x:%04x", m->vid, m->pid);
-        cJSON_AddStringToObject(o, "usb_id", vp);
-        cJSON_AddStringToObject(o, "usb_chip", us_chip_name(us_chip_for(m->vid, m->pid, true)));
-        cJSON_AddStringToObject(o, "radio", m->radio);
-        cJSON_AddStringToObject(o, "family", family_name(m->family));
-        cJSON_AddStringToObject(o, "protocol", proto_name(m->proto));
-        cJSON_AddNumberToObject(o, "baud", m->baud);
-        cJSON_AddBoolToObject(o, "rtscts_wired", m->hw_flow);
-        cJSON_AddStringToObject(o, "bootloader_entry", reset_name(m->reset));
-        cJSON_AddBoolToObject(o, "flashable", m->family == FAM_SILABS);
-        cJSON_AddStringToObject(o, "note", m->note ? m->note : "");
-        cJSON_AddBoolToObject(o, "downloaded", true);
-        cJSON_AddItemToArray(a, o);
-    }
+    for (int i = 0; ex && i < nex; i++) add_model(a, &ex[i], true);
     for (const dongle_model_t *m = dongle_models(); m->id; m++) {
         if (strcmp(m->id, last) == 0 && a->child) continue;  // same model, another USB ID
         last = m->id;
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "id", m->id);
-        cJSON_AddStringToObject(o, "name", m->name);
-        char vp[10];
-        snprintf(vp, sizeof(vp), "%04x:%04x", m->vid, m->pid);
-        cJSON_AddStringToObject(o, "usb_id", vp);
-        cJSON_AddStringToObject(o, "usb_chip", us_chip_name(us_chip_for(m->vid, m->pid, true)));
-        cJSON_AddStringToObject(o, "radio", m->radio);
-        cJSON_AddStringToObject(o, "family", family_name(m->family));
-        cJSON_AddStringToObject(o, "protocol", proto_name(m->proto));
-        cJSON_AddNumberToObject(o, "baud", m->baud);
-        cJSON_AddBoolToObject(o, "rtscts_wired", m->hw_flow);
-        cJSON_AddStringToObject(o, "bootloader_entry", reset_name(m->reset));
-        cJSON_AddBoolToObject(o, "flashable", m->family == FAM_SILABS);
-        cJSON_AddStringToObject(o, "note", m->note ? m->note : "");
-        cJSON_AddItemToArray(a, o);
+        add_model(a, m, false);
     }
     return send_json(req, a);
 }
 
+// ?radio=n picks the radio whose stick the firmware pages work on; it stays picked. Refused while another
+// radio's stick is being flashed. false = the error answer has been sent.
+static bool pick_radio(httpd_req_t *req) {
+    char q[200], v[8];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK || httpd_query_key_value(q, "radio", v, sizeof(v)) != ESP_OK)
+        return true;
+    if (!(v[0] >= '0' && v[0] < '0' + RADIO_MAX && v[1] == 0)) {
+        char m[40];
+        snprintf(m, sizeof(m), "radio is 0-%d", RADIO_MAX - 1);
+        send_error(req, "400 Bad Request", m);
+        return false;
+    }
+    // The flash task reads the target radio throughout (claim, baud, saving the link): never move it while the
+    // image store is busy (an upload, a download or a flash), only "the same radio" passes.
+    if ((ncpflash_busy() && v[0] - '0' != dongle_fl_index()) || !dongle_fl_select(v[0] - '0')) {
+        send_error(req, "409 Conflict", "Another radio's stick is being flashed: wait for it to finish");
+        return false;
+    }
+    return true;
+}
+
 static esp_err_t h_dongle_get(httpd_req_t *req) {
     REQUIRE_AUTH(req);
+    if (!pick_radio(req)) return ESP_OK;
     return send_dongle_state(req);
+}
+
+// USB devices on J3 (hub, sticks, which radio has which) and the full-speed-only state.
+static esp_err_t h_usb(httpd_req_t *req) {
+    REQUIRE_AUTH(req);
+    dongle_usb_t *u = malloc(sizeof(dongle_usb_t));
+    if (!u) return send_error(req, "500 Internal Server Error", "out of memory");
+    dongle_usb_snapshot(u);
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "fs_only", u->fs_only);
+    cJSON_AddBoolToObject(r, "fs_forced", u->fs_forced);
+    cJSON_AddNumberToObject(r, "reforces", u->reforces);
+    cJSON_AddNumberToObject(r, "refused", u->refused);
+    cJSON_AddNumberToObject(r, "radio_max", RADIO_MAX);
+    cJSON *a = cJSON_AddArrayToObject(r, "devices");
+    for (int i = 0; i < u->n; i++) {
+        const dongle_usb_dev_t *d = &u->dev[i];
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "addr", d->addr);
+        cJSON_AddNumberToObject(o, "hub_port", d->hub_port);
+        cJSON_AddBoolToObject(o, "hub", d->is_hub);
+        cJSON_AddStringToObject(o, "speed", d->high_speed ? "high" : "full");
+        add_usb_id(o, "usb_id", d->vid, d->pid);
+        cJSON_AddStringToObject(o, "product", d->product);
+        if (d->radio >= 0) cJSON_AddNumberToObject(o, "radio", d->radio);
+        else cJSON_AddNullToObject(o, "radio");
+        cJSON_AddItemToArray(a, o);
+    }
+    free(u);
+    return send_json(req, r);
+}
+
+// {"radio": n}: forget a radio whose stick is gone (its saved stick and set-up state), so it disappears and the next
+// new stick takes it (replacing a stick behind the hub).
+// Every task's stack (size, least free so far, where it lives) and the heaps.
+static esp_err_t h_tasks(httpd_req_t *req) {
+    REQUIRE_AUTH(req);
+    cJSON *r = cJSON_CreateObject();
+    tasks_add_json(r);
+    return send_json(req, r);
+}
+
+// {"confirm": true}: erase the microSD card and make a fresh FAT file system on it.
+static esp_err_t h_sd_format(httpd_req_t *req) {
+    REQUIRE_SESSION(req);
+    cJSON *j = read_json(req);
+    bool yes = j && cJSON_IsTrue(cJSON_GetObjectItem(j, "confirm"));
+    cJSON_Delete(j);
+    if (!yes) return send_error(req, "400 Bad Request", "Send {\"confirm\": true} to erase the card");
+    char err[112] = "";
+    if (sdlog_format(err, sizeof(err)) != ESP_OK) {
+        stats_event(EV_WARN, "SD card format failed: %s", err);
+        return send_error(req, "409 Conflict", err);
+    }
+    stats_event(EV_WARN, "SD card formatted from the dashboard: everything on it was erased");
+    return send_ok(req);
+}
+
+static esp_err_t h_radio_forget(httpd_req_t *req) {
+    REQUIRE_SESSION(req);
+    cJSON *j = read_json(req);
+    const cJSON *v = j ? cJSON_GetObjectItem(j, "radio") : NULL;
+    int r = cJSON_IsNumber(v) && v->valuedouble == (int)v->valuedouble ? v->valueint : -1;
+    cJSON_Delete(j);
+    char err[96];
+    if (r < 0 || r >= RADIO_MAX) {
+        snprintf(err, sizeof(err), "radio is 0-%d", RADIO_MAX - 1);
+        return send_error(req, "400 Bad Request", err);
+    }
+    if (dx_forget(dongle_at(r), err, sizeof(err)) != ESP_OK) return send_error(req, "409 Conflict", err);
+    fwcat_forget(r);
+    return send_ok(req);
 }
 
 // "%41b" -> "Ab", and only printable ASCII kept.
@@ -1315,35 +1641,39 @@ static esp_err_t h_dongle_delete(httpd_req_t *req) {
     return send_dongle_state(req);
 }
 
-// {"md5": "<the stored image's MD5>"}: flashes the dongle (Zigbee2MQTT is cut off meanwhile).
+// Checks GitHub for the picked radio's stick.
 static esp_err_t h_fw_check(httpd_req_t *req) {
     REQUIRE_SESSION(req);
-    fwcat_check_now();
+    if (!pick_radio(req)) return ESP_OK;
+    fwcat_check_now(dongle_fl_index());
     vTaskDelay(pdMS_TO_TICKS(50));  // so the answer already says "checking"
     return send_dongle_state(req);
 }
 
 static esp_err_t h_fw_download(httpd_req_t *req) {
     REQUIRE_SESSION(req);
+    if (!pick_radio(req)) return ESP_OK;
     cJSON *j = read_json(req);
     const cJSON *n = j ? cJSON_GetObjectItem(j, "name") : NULL;
     char why[96];
-    bool ok = cJSON_IsString(n) && fwcat_download(n->valuestring, why, sizeof(why));
+    bool ok = cJSON_IsString(n) && fwcat_download(dongle_fl_index(), n->valuestring, why, sizeof(why));
     if (!cJSON_IsString(n)) strlcpy(why, "name missing", sizeof(why));
     cJSON_Delete(j);
     if (!ok) return send_error(req, "409 Conflict", why);
     return send_dongle_state(req);
 }
 
+// {"md5": "<the stored image's MD5>"}: flashes the picked radio's stick (its client is cut off meanwhile).
 static esp_err_t h_dongle_flash(httpd_req_t *req) {
     REQUIRE_SESSION(req);
+    if (!pick_radio(req)) return ESP_OK;
     cJSON *j = read_json(req);
     const cJSON *m = j ? cJSON_GetObjectItem(j, "md5") : NULL;
     char why[96];
     bool ok = ncpflash_flash(cJSON_IsString(m) ? m->valuestring : NULL, why, sizeof(why));
     cJSON_Delete(j);
     if (!ok) return send_error(req, "409 Conflict", why);
-    stats_event(EV_INFO, "Dongle flash requested from the dashboard");
+    stats_event(EV_INFO, "Radio %d: stick flash requested from the dashboard", dongle_fl_index() + 1);
     return send_dongle_state(req);
 }
 
@@ -1363,7 +1693,7 @@ static esp_err_t h_metrics(httpd_req_t *req) {
     int health = stats_health(reason, sizeof(reason));
     dongle_flow_t fl;
     dongle_flow_stats(&fl);
-    const int cap = 6144;
+    const int cap = 8192;
     char *b = malloc(cap);
     if (!b) return httpd_resp_send_500(req);
     int n = 0;
@@ -1411,6 +1741,21 @@ static esp_err_t h_metrics(httpd_req_t *req) {
       fl.line.err_framing + fl.line.err_hw_overrun + fl.line.err_queue_overrun + fl.line.err_parity + fl.line.err_break);
     M("cp2102n_out_queue_max_bytes", "gauge", fl.line.out_queue_max);
 #undef M
+    // Every radio, labelled radio="1".."3" (radio 1 is the coordinator above).
+    radio_stats_t rs[RADIO_MAX];
+    stats_lock();
+    memcpy(rs, g_radio, sizeof(rs));
+    stats_unlock();
+#define R(name, type, field)                                                                \
+    if (n < cap) n += snprintf(b + n, cap - n, "# TYPE zbbridge_radio_" name " " type "\n"); \
+    for (int i = 0; i < RADIO_MAX && n < cap; i++)                                           \
+        n += snprintf(b + n, cap - n, "zbbridge_radio_" name "{radio=\"%d\"} %.6g\n", i + 1, (double)(rs[i].field));
+    R("stick_connected", "gauge", open)
+    R("client_connected", "gauge", client_connected)
+    R("bytes_from_stick_total", "counter", bytes_in)
+    R("bytes_to_stick_total", "counter", bytes_out)
+    R("client_drops_total", "counter", client_drops)
+#undef R
     if (n > cap - 1) n = cap - 1;
     httpd_resp_set_type(req, "text/plain; version=0.0.4");
     esp_err_t e = httpd_resp_send(req, b, n);
@@ -1438,7 +1783,7 @@ void web_start(void) {
     s_sess_lock = xSemaphoreCreateMutex();
     sessions_load();
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 40;
+    cfg.max_uri_handlers = 48;
     cfg.stack_size = 10240;
     cfg.lru_purge_enable = true;
     cfg.max_open_sockets = 12;
@@ -1487,6 +1832,10 @@ void web_start(void) {
         {"/api/dongle/flash", HTTP_POST, h_dongle_flash},
         {"/api/dongle/firmware/check", HTTP_POST, h_fw_check},
         {"/api/dongle/firmware/download", HTTP_POST, h_fw_download},
+        {"/api/usb", HTTP_GET, h_usb},
+        {"/api/radio/forget", HTTP_POST, h_radio_forget},
+        {"/api/sd/format", HTTP_POST, h_sd_format},
+        {"/api/tasks", HTTP_GET, h_tasks},
         {"/metrics", HTTP_GET, h_metrics},
 #ifdef CONFIG_BRIDGE_TEST_HOOKS
         {"/api/debug/watchdog", HTTP_POST, h_debug_watchdog},

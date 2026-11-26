@@ -2,7 +2,7 @@
 // one banner, one dialog, toasts), with the bridge's pills and banners.
 
 import { useEffect } from "preact/hooks";
-import { auth, awaitReboot, post, reachable, rebootNeeded, refreshAll, startPolling, status, toast } from "./store";
+import { ROLE_CLIENT, auth, awaitReboot, post, reachable, rebootNeeded, refreshAll, setRadioPick, startPolling, status, toast } from "./store";
 import { Icon } from "./icons";
 import { href, route } from "./route";
 import { confirmIt } from "./dialog";
@@ -14,6 +14,7 @@ import { Overview } from "./pages/Overview";
 import { Devices } from "./pages/Devices";
 import { Events } from "./pages/Events";
 import { Settings } from "./pages/Settings";
+import { radioProblem, radioState, stickName } from "./pages/Radios";
 import { System } from "./pages/System";
 
 const NAV = [
@@ -27,7 +28,7 @@ const NAV = [
 initTheme("zb.theme");
 
 export async function rebootNow() {
-  if (!(await confirmIt({ title: "Reboot the bridge?", body: "Zigbee2MQTT loses its coordinator for about 10 seconds and reconnects by itself.", confirm: "Reboot" }))) return;
+  if (!(await confirmIt({ title: "Reboot the bridge?", body: "Every radio's client (Zigbee2MQTT and the others) loses its stick for about 10 seconds and reconnects by itself.", confirm: "Reboot" }))) return;
   try {
     await post("/api/reboot");
     awaitReboot("Rebooting…");
@@ -60,16 +61,36 @@ export function App() {
   );
 }
 
+const PILL_LABEL: Record<string, string> = { zigbee: "Zigbee2MQTT", zha: "ZHA", thread: "Thread", zwave: "Z-Wave JS" };
+
 function TopRight() {
   const s = status.value;
   if (!s) return null;
   const net = s.ncp.network;
+  const radios = s.radios ?? [];
   return (
     <>
       <Pill ok={s.eth.link && s.eth.has_ip} label={s.eth.link ? `${s.eth.speed} Mbps` : "No link"} title={s.eth.link ? `Ethernet ${s.eth.speed} Mbps, ${s.eth.ip}` : "Ethernet link down"} />
-      <Pill ok={s.dongle.open} label={s.dongle.open ? "Dongle" : "No dongle"} title={s.dongle.open ? `${s.dongle.product} (${s.dongle.serial})` : "No Zigbee dongle on J3"} />
-      <Pill ok={s.client.connected} label={s.client.connected ? "Zigbee2MQTT" : "No Zigbee2MQTT"} title={s.client.connected ? `Zigbee2MQTT connected from ${s.client.ip}` : `Waiting for Zigbee2MQTT on tcp/${s.client.tcp_port}`} />
-      {net !== "unknown" && <Pill ok={net === "up"} label={net === "up" ? "Network up" : "Network down"} title={`The coordinator reports the Zigbee network ${net}`} />}
+      {/* One pill per radio, named after its app: its colour covers the stick, the client and (radio 1) the Zigbee network.
+          A click opens that radio on the Overview. */}
+      {radios.map((r) => {
+        const bad = radioProblem(r);
+        const st = radioState(r);
+        const netDown = r.index === 0 && net === "down";
+        const tone = netDown ? "bad" : st.tone === "muted" ? undefined : st.tone;
+        const parts = [
+          `Radio ${r.index + 1}${r.name ? ` (${r.name})` : ""}`,
+          bad ?? (r.state === "no_stick" ? "no stick" : r.state === "opening" ? "opening the stick" : r.state === "flashing" ? "the stick is being flashed"
+            : `${stickName(r)}${r.stick.hub_port ? ` on hub port ${r.stick.hub_port}` : ""}`),
+          r.client.connected ? `${ROLE_CLIENT[r.role] ?? "client"} connected from ${r.client.ip}` : `waiting for ${ROLE_CLIENT[r.role] ?? "a client"} on tcp/${r.tcp_port}`,
+          ...(r.index === 0 && net !== "unknown" ? [`Zigbee network ${net}`] : []),
+        ];
+        return (
+          <span key={r.index} onClick={() => setRadioPick(r.index)}>
+            <Pill tone={tone} label={PILL_LABEL[r.role] ?? r.name} title={parts.join(" · ")} href={href("overview")} />
+          </span>
+        );
+      })}
       {s.update_available && (
         <Pill tone="warn" icon="download" href={href("system")} label={`Update ${s.update_available}`} title={`Firmware ${s.update_available} is available on git: install it on the System page`} />
       )}
@@ -83,7 +104,7 @@ function Banners() {
   if (s && !s.eth.link) return <div class="banner bad"><Icon name="alert" size={16} /> Ethernet link is down.</div>;
   if (rebootNeeded.value) {
     return (
-      <div class="banner warn"><Icon name="refresh" size={16} /> Saved. Network, port or baud changes take effect after a reboot.
+      <div class="banner warn"><Icon name="refresh" size={16} /> Saved. Network and full-speed-only USB changes take effect after a reboot.
         <button type="button" class="link-btn" onClick={rebootNow}>Reboot now</button></div>
     );
   }

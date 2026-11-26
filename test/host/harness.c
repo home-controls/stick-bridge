@@ -8,6 +8,17 @@
 #include "esp_timer.h"
 #include "ezsp_decode.h"
 #include "stats.h"
+#include "settings.h"
+
+// stats_health asks the settings about the radios: on the host, radio 1 is Zigbee2MQTT and nothing else is set up.
+uint8_t settings_radio_role(int radio) {
+    (void)radio;
+    return RADIO_ROLE_ZIGBEE;
+}
+bool settings_radio_is_set_up(int radio) {
+    (void)radio;
+    return false;
+}
 
 int64_t g_now_us;
 esp_timer_cb_t g_tick_cb;

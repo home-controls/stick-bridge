@@ -1,4 +1,5 @@
 #include "fwcat.h"
+#include "tasks.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@ static const char *TAG = "fwcat";
 #define URL_MAX 2048          // GitHub's signed release-asset redirects are long
 #define AUTO_FIRST_S 120      // first automatic check after boot
 #define AUTO_EVERY_S 86400    // then daily (the API allows 60 unauthenticated requests per hour)
+#define REUSE_S 600           // another radio's identical check younger than this is reused
 #define NOTIFY_CHECK BIT0
 #define NOTIFY_DOWNLOAD BIT1
 
@@ -41,20 +43,31 @@ typedef enum { DL_IDLE = 0, DL_RUNNING, DL_DONE, DL_FAILED } dl_state_t;
 
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_task;
-static struct {
+// One check result per radio, for the stick that radio had when it was checked.
+typedef struct {
     bool checking;
     int64_t checked_epoch;  // 0 = never
-    uint32_t checked_up;
+    uint32_t checked_up;    // 0 = never
     char error[112];
     char repo[64];
     char release[48];
     bool prerelease;
+    bool fw_pre;  // the pre-release setting the check ran with (part of what makes two checks the same)
+    uint32_t baud;  // the radio's baud and the stick's RTS/CTS wiring: builds are ranked by both
+    bool wired;
     char board[48];
     char model[48];
     char type[16];
+    uint16_t vid, pid;
+    char serial[48];
     int ncand;
-    cand_t cand[MAX_CAND];
+    cand_t *cand;  // [MAX_CAND], ~6.7 KB each: in PSRAM (fwcat_start)
+} res_t;
+static res_t s_res[RADIO_MAX];
+static uint32_t s_check_req;  // bit i: check radio i (guarded by s_lock)
+static struct {
     dl_state_t dl;
+    int radio;  // whose check the download came from
     char dl_name[112];
     uint32_t dl_done, dl_total;
     char dl_error[112];
@@ -210,6 +223,7 @@ static void db_refresh(void) {
     int status;
     int64_t len;
     const char *why = NULL;
+    char whybuf[40];
     esp_http_client_handle_t c = gh_open(url, false, &status, &len, &why);
     char *body = NULL;
     if (c && status == 200) {
@@ -222,7 +236,8 @@ static void db_refresh(void) {
     } else if (c && status == 404) {
         why = "none published";
     } else if (c) {
-        why = "server error";
+        snprintf(whybuf, sizeof(whybuf), "the server answered %d", status);
+        why = whybuf;
     }
     if (c) esp_http_client_cleanup(c);
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -254,10 +269,10 @@ static void db_refresh(void) {
     dongles_set_extra(m, n);  // the old list is left allocated: something may still point into it
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_db_count = n;
-    snprintf(s_db_status, sizeof(s_db_status), "%d dongle%s%s", n, n == 1 ? "" : "s", skipped ? " (some entries skipped)" : "");
+    snprintf(s_db_status, sizeof(s_db_status), "%d stick%s%s", n, n == 1 ? "" : "s", skipped ? " (some entries skipped)" : "");
     xSemaphoreGive(s_lock);
-    ESP_LOGI(TAG, "Dongle list from git: %d entries, %d skipped", n, skipped);
-    if (skipped) stats_event(EV_WARN, "Downloaded dongle list: %d entries skipped (bad fields)", skipped);
+    ESP_LOGI(TAG, "Stick list from git: %d entries, %d skipped", n, skipped);
+    if (skipped) stats_event(EV_WARN, "Downloaded stick list: %d entries skipped (bad fields)", skipped);
     dongle_rematch();
 }
 
@@ -270,6 +285,7 @@ typedef struct {
     uint32_t baud;
     bool wired;
     int rel;  // release index the kept candidates come from (-1 none yet)
+    res_t *r;
     int n;
     cand_t c[MAX_CAND];
     int seen;  // assets scanned
@@ -293,8 +309,8 @@ static void on_asset(void *ctx, const fc_release_t *rel, const fc_asset_t *a) {
     // usable variants score >= 0; hw_flow on a board without RTS/CTS is listed but scored -1
     c->score = sc->ti ? 100 : fc_score(&n, sc->board, sc->type, sc->baud, sc->wired);
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    strlcpy(s.release, rel->tag, sizeof(s.release));
-    s.prerelease = rel->prerelease;
+    strlcpy(sc->r->release, rel->tag, sizeof(sc->r->release));
+    sc->r->prerelease = rel->prerelease;
     xSemaphoreGive(s_lock);
 }
 
@@ -316,18 +332,54 @@ static void set_error(char *dst, size_t n, const char *fmt, ...) {
 
 static int cmp_cand(const void *x, const void *y) { return ((const cand_t *)y)->score - ((const cand_t *)x)->score; }
 
-static void do_check(void) {
+static void do_check(int radio) {
+    res_t *R = &s_res[radio];
     dongle_info_t d;
-    dongle_info(&d);
+    dx_info(dongle_at(radio), &d);
     bridge_settings_t cfg;
     settings_get(&cfg);
+    uint8_t role = settings_radio_role(radio);
+    bool ti = d.model->family == FAM_TI;
+    const char *type = ti ? "coordinator" : role == BRIDGE_ROLE_THREAD ? "openthread_rcp" : "zigbee_ncp";
+    const char *repo = ti ? CONFIG_BRIDGE_TI_FW_REPO : cfg.fw_repo;
+    const char *board = d.model->fw_board ? d.model->fw_board : "";
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    s.checking = true;
-    s.error[0] = 0;
-    strlcpy(s.repo, cfg.fw_repo, sizeof(s.repo));
-    strlcpy(s.model, d.model->name, sizeof(s.model));
-    strlcpy(s.board, d.model->fw_board ? d.model->fw_board : "", sizeof(s.board));
+    R->checking = true;
+    R->error[0] = 0;
+    R->release[0] = 0;
+    R->ncand = 0;
+    R->fw_pre = cfg.fw_prerelease;
+    R->baud = settings_radio_baud(radio);
+    R->wired = d.model->hw_flow;
+    R->vid = d.vid;
+    R->pid = d.pid;
+    strlcpy(R->serial, d.serial, sizeof(R->serial));
+    strlcpy(R->repo, repo, sizeof(R->repo));
+    strlcpy(R->model, d.model->name, sizeof(R->model));
+    strlcpy(R->board, board, sizeof(R->board));
+    strlcpy(R->type, type, sizeof(R->type));
+    // The same check for another radio a few minutes ago (two identical sticks): reuse it, GitHub's API allows
+    // 60 unauthenticated requests an hour.
+    bool reused = false;
+    uint32_t up = stats_uptime_s();
+    for (int j = 0; j < RADIO_MAX && board[0]; j++) {
+        res_t *o = &s_res[j];
+        if (j == radio || o->checking || !o->checked_up || up - o->checked_up > REUSE_S || o->error[0]) continue;
+        if (strcmp(o->board, board) || strcmp(o->type, type) || strcmp(o->repo, repo) || o->fw_pre != R->fw_pre ||
+            o->baud != R->baud || o->wired != R->wired)
+            continue;
+        memcpy(R->cand, o->cand, sizeof(cand_t) * o->ncand);
+        R->ncand = o->ncand;
+        strlcpy(R->release, o->release, sizeof(R->release));
+        R->prerelease = o->prerelease;
+        R->checked_epoch = o->checked_epoch;
+        R->checked_up = o->checked_up;
+        R->checking = false;
+        reused = true;
+        break;
+    }
     xSemaphoreGive(s_lock);
+    if (reused) return;
 
     const char *why = NULL;
     scan_t *sc = calloc(1, sizeof(*sc));
@@ -336,27 +388,22 @@ static void do_check(void) {
     if (!sc || !buf) {
         why = "out of memory";
     } else if (!d.model->fw_board || (d.model->family != FAM_SILABS && d.model->family != FAM_TI)) {
-        set_error(s.error, sizeof(s.error), "No firmware list for %s (%s radio)%s", d.model->name,
-                  family_name(d.model->family), d.model->family == FAM_UNKNOWN ? ": dongle not identified" : "");
-    } else if (d.model->family == FAM_TI && cfg.role == BRIDGE_ROLE_THREAD) {
-        set_error(s.error, sizeof(s.error), "TI dongles run Z-Stack (Zigbee) only: set the role to Zigbee");
+        set_error(R->error, sizeof(R->error), "No firmware updates through the bridge for %s (%s)%s", d.model->name,
+                  family_name(d.model->family), d.model->family == FAM_UNKNOWN ? ": stick not identified" : "");
+    } else if (ti && role == BRIDGE_ROLE_THREAD) {
+        set_error(R->error, sizeof(R->error), "TI sticks run Z-Stack (Zigbee) only: set the role to Zigbee2MQTT or ZHA");
     } else {
+        sc->r = R;
         sc->board = d.model->fw_board;
-        sc->ti = d.model->family == FAM_TI;
-        sc->type = sc->ti ? "coordinator" : cfg.role == BRIDGE_ROLE_THREAD ? "openthread_rcp" : "zigbee_ncp";
-        xSemaphoreTake(s_lock, portMAX_DELAY);
-        strlcpy(s.type, sc->type, sizeof(s.type));
-        xSemaphoreGive(s_lock);
-        sc->baud = cfg.baud;
+        sc->ti = ti;
+        sc->type = type;
+        sc->baud = settings_radio_baud(radio);  // the radio's link
         sc->wired = d.model->hw_flow;
         sc->rel = -1;
         char url[160];
-        if (sc->ti) {
+        if (ti) {
             // coordinator and router releases alternate (and old ones have no files): look at a few
             snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases?per_page=8", CONFIG_BRIDGE_TI_FW_REPO);
-            xSemaphoreTake(s_lock, portMAX_DELAY);
-            strlcpy(s.repo, CONFIG_BRIDGE_TI_FW_REPO, sizeof(s.repo));
-            xSemaphoreGive(s_lock);
         } else if (cfg.fw_prerelease) {
             snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases?per_page=2", cfg.fw_repo);
         } else {
@@ -366,7 +413,7 @@ static void do_check(void) {
         int64_t len;
         c = gh_open(url, true, &status, &len, &why);
         if (c && status != 200) {
-            set_error(s.error, sizeof(s.error), "GitHub answered %d%s", status,
+            set_error(R->error, sizeof(R->error), "GitHub answered %d%s", status,
                       status == 403 || status == 429 ? " (rate limited: try again in an hour)" : status == 404 ? " (no such repo or no releases)" : "");
         } else if (c) {
             fc_json_t *j = malloc(sizeof(*j));
@@ -382,26 +429,28 @@ static void do_check(void) {
             }
         }
     }
-    if (why) set_error(s.error, sizeof(s.error), "%s", why);
+    if (why) set_error(R->error, sizeof(R->error), "%s", why);
     if (c) esp_http_client_cleanup(c);
     if (sc) {
         qsort(sc->c, sc->n, sizeof(cand_t), cmp_cand);
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        s.ncand = sc->n;
-        memcpy(s.cand, sc->c, sizeof(cand_t) * sc->n);
-        if (!s.error[0] && sc->n == 0 && sc->board)
-            snprintf(s.error, sizeof(s.error), "No %s build for board '%s' in the newest release%s (%d files)", sc->type, sc->board,
+        R->ncand = sc->n;
+        memcpy(R->cand, sc->c, sizeof(cand_t) * sc->n);
+        if (!R->error[0] && sc->n == 0 && sc->board)
+            snprintf(R->error, sizeof(R->error), "No %s build for board '%s' in the newest release%s (%d files)", sc->type, sc->board,
                      cfg.fw_prerelease ? "s" : "", sc->seen);
-        if (sc->n == 0) s.release[0] = 0;
+        if (sc->n == 0) R->release[0] = 0;
         xSemaphoreGive(s_lock);
-        ESP_LOGI(TAG, "Checked %s for %s: %d files, %d for this board", cfg.fw_repo, sc->board ? sc->board : "?", sc->seen, sc->n);
+        ESP_LOGI(TAG, "Radio %d: checked %s for %s: %d files, %d for this board", radio + 1, repo, board[0] ? board : "?",
+                 sc->seen, sc->n);
     }
     free(buf);
     free(sc);
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    s.checking = false;
-    s.checked_epoch = epoch_now();
-    s.checked_up = stats_uptime_s();
+    R->checking = false;
+    R->checked_epoch = epoch_now();
+    R->checked_up = stats_uptime_s();
+    if (!R->checked_up) R->checked_up = 1;
     xSemaphoreGive(s_lock);
 }
 
@@ -412,9 +461,10 @@ static void do_download(void) {
     memset(&c, 0, sizeof(c));
     bool found = false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (int i = 0; i < s.ncand; i++)
-        if (strcmp(s.cand[i].a.name, s_want) == 0) {
-            c = s.cand[i];
+    res_t *R = &s_res[s.radio];
+    for (int i = 0; i < R->ncand; i++)
+        if (strcmp(R->cand[i].a.name, s_want) == 0) {
+            c = R->cand[i];
             found = true;
         }
     s.dl = DL_RUNNING;
@@ -485,15 +535,16 @@ static void do_download(void) {
     s.dl = why ? DL_FAILED : DL_DONE;
     if (why) strlcpy(s.dl_error, why, sizeof(s.dl_error));
     xSemaphoreGive(s_lock);
-    if (why) stats_event(EV_WARN, "Dongle firmware download failed: %s", why);
-    else stats_event(EV_INFO, "Dongle firmware %s downloaded (SHA-256 checked): ready to flash", s_want);
+    if (why) stats_event(EV_WARN, "Radio %d: firmware download failed: %s", s.radio + 1, why);
+    else stats_event(EV_INFO, "Radio %d: firmware %s downloaded (SHA-256 checked): ready to flash", s.radio + 1, s_want);
 }
 
 // ---------------------------------------------------------------- task + API
 
 static void fwcat_task(void *arg) {
     (void)arg;
-    uint32_t next_auto = AUTO_FIRST_S, next_db = 30;
+    uint32_t next_db = 30, next_auto[RADIO_MAX];
+    for (int i = 0; i < RADIO_MAX; i++) next_auto[i] = AUTO_FIRST_S + 30 * i;
     for (;;) {
         uint32_t bits = 0;
         xTaskNotifyWait(0, UINT32_MAX, &bits, pdMS_TO_TICKS(10000));
@@ -502,33 +553,65 @@ static void fwcat_task(void *arg) {
             db_refresh();
             next_db = stats_uptime_s() + AUTO_EVERY_S;
         }
-        bool auto_due = false;
-        if (stats_uptime_s() >= next_auto) {
-            dongle_info_t d;
-            dongle_info(&d);
-            if (dongle_ready() && (d.model->family == FAM_SILABS || d.model->family == FAM_TI) && d.model->fw_board) auto_due = true;
-            next_auto = stats_uptime_s() + (auto_due ? AUTO_EVERY_S : 300);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        uint32_t req = s_check_req;
+        s_check_req = 0;
+        xSemaphoreGive(s_lock);
+        for (int i = 0; i < RADIO_MAX; i++) {
+            bool due = false;
+            if (stats_uptime_s() >= next_auto[i]) {
+                dongle_info_t d;
+                dx_info(dongle_at(i), &d);
+                bool can = dx_ready(dongle_at(i)) && (d.model->family == FAM_SILABS || d.model->family == FAM_TI) && d.model->fw_board;
+                due = can && net_has_ip();
+                next_auto[i] = stats_uptime_s() + (due ? AUTO_EVERY_S : 300);
+            }
+            if (((req >> i) & 1u) || due) do_check(i);
         }
-        if ((bits & NOTIFY_CHECK) || auto_due) do_check();
     }
 }
 
 void fwcat_start(void) {
     s_lock = xSemaphoreCreateMutex();
-    xTaskCreate(fwcat_task, "fwcat", 8192, NULL, 4, &s_task);
+    for (int i = 0; i < RADIO_MAX; i++) {
+        s_res[i].cand = heap_caps_calloc(MAX_CAND, sizeof(cand_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_res[i].cand) s_res[i].cand = calloc(MAX_CAND, sizeof(cand_t));
+        if (!s_res[i].cand) return;  // no catalogue rather than no bridge
+    }
+    s_task = task_start(fwcat_task, "fwcat", 8192, NULL, 4, false);  // downloads write the image area
 }
 
-void fwcat_check_now(void) {
-    if (s_task) xTaskNotify(s_task, NOTIFY_CHECK, eSetBits);
-}
-
-bool fwcat_download(const char *name, char *why, size_t why_len) {
+void fwcat_check_now(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX || !s_task) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    bool busy = s.dl == DL_RUNNING || s.checking, have = false;
-    for (int i = 0; i < s.ncand; i++)
-        if (strcmp(s.cand[i].a.name, name) == 0) have = true;
+    s_check_req |= 1u << radio;
+    xSemaphoreGive(s_lock);
+    xTaskNotify(s_task, NOTIFY_CHECK, eSetBits);
+}
+
+void fwcat_forget(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX || !s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    res_t *R = &s_res[radio];
+    if (!R->checking) {
+        R->ncand = 0;
+        R->checked_up = 0;
+        R->checked_epoch = 0;
+        R->error[0] = R->release[0] = 0;
+    }
+    xSemaphoreGive(s_lock);
+}
+
+bool fwcat_download(int radio, const char *name, char *why, size_t why_len) {
+    if (radio < 0 || radio >= RADIO_MAX) radio = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    res_t *R = &s_res[radio];
+    bool busy = s.dl == DL_RUNNING || R->checking, have = false;
+    for (int i = 0; i < R->ncand; i++)
+        if (strcmp(R->cand[i].a.name, name) == 0) have = true;
     if (!busy && have) {
         strlcpy(s_want, name, sizeof(s_want));
+        s.radio = radio;
         s.dl = DL_RUNNING;  // shows at once; the task fills in the rest
         s.dl_done = 0;
     }
@@ -538,54 +621,64 @@ bool fwcat_download(const char *name, char *why, size_t why_len) {
         return false;
     }
     if (!have) {
-        strlcpy(why, "That file isn't in the last check: check again", why_len);
+        strlcpy(why, "That file isn't in this radio's last check: check again", why_len);
         return false;
     }
     if (ncpflash_busy()) {
         xSemaphoreTake(s_lock, portMAX_DELAY);
         s.dl = DL_IDLE;
         xSemaphoreGive(s_lock);
-        strlcpy(why, "The dongle is being flashed", why_len);
+        strlcpy(why, "A stick is being flashed", why_len);
         return false;
     }
     xTaskNotify(s_task, NOTIFY_DOWNLOAD, eSetBits);
     return true;
 }
 
-static void stack_str(char *out, size_t n) {
+// The version builds are compared against: what the traffic showed (any radio), else radio 0's EZSP decoder.
+static void stack_str(int radio, char *out, size_t n) {
     dongle_info_t d;
-    dongle_info(&d);
-    if (d.fw_version[0] && d.proto_detected != PROTO_EZSP) {  // Spinel / Z-Stack, read off the traffic
+    dx_info(dongle_at(radio), &d);
+    if (d.fw_version[0]) {
         strlcpy(out, d.fw_version, n);
         return;
     }
+    out[0] = 0;
+    if (radio != 0) return;
     stats_lock();
     uint8_t ezsp = g_stats.ezsp_version;
     uint16_t v = g_stats.stack_version;
     stats_unlock();
     if (ezsp) snprintf(out, n, "%u.%u.%u.%u", (v >> 12) & 15, (v >> 8) & 15, (v >> 4) & 15, v & 15);
-    else out[0] = 0;
 }
 
-void fwcat_add_json(cJSON *root) {
+void fwcat_add_json(cJSON *root, int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) radio = 0;
     char cur[24];
-    stack_str(cur, sizeof(cur));
+    stack_str(radio, cur, sizeof(cur));
+    dongle_info_t d;
+    dx_info(dongle_at(radio), &d);
     cJSON *o = cJSON_AddObjectToObject(root, "catalog");
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    cJSON_AddBoolToObject(o, "checking", s.checking);
-    cJSON_AddNumberToObject(o, "checked", (double)s.checked_epoch);
-    cJSON_AddNumberToObject(o, "checked_ago", s.checked_up ? (double)(stats_uptime_s() - s.checked_up) : -1);
-    cJSON_AddStringToObject(o, "error", s.error);
-    cJSON_AddStringToObject(o, "repo", s.repo);
-    cJSON_AddStringToObject(o, "release", s.release);
-    cJSON_AddBoolToObject(o, "prerelease", s.prerelease);
-    cJSON_AddStringToObject(o, "board", s.board);
-    cJSON_AddStringToObject(o, "type", s.type);
-    cJSON_AddStringToObject(o, "model", s.model);
+    const res_t *R = &s_res[radio];
+    // A check for the stick this radio had before (since replaced) doesn't count.
+    bool mine = R->checking || (R->vid == d.vid && R->pid == d.pid && strcmp(R->serial, d.serial) == 0);
+    int ncand = mine ? R->ncand : 0;
+    cJSON_AddNumberToObject(o, "radio", radio);
+    cJSON_AddBoolToObject(o, "checking", R->checking);
+    cJSON_AddNumberToObject(o, "checked", mine ? (double)R->checked_epoch : 0);
+    cJSON_AddNumberToObject(o, "checked_ago", mine && R->checked_up ? (double)(stats_uptime_s() - R->checked_up) : -1);
+    cJSON_AddStringToObject(o, "error", mine ? R->error : "");
+    cJSON_AddStringToObject(o, "repo", R->repo);
+    cJSON_AddStringToObject(o, "release", mine ? R->release : "");
+    cJSON_AddBoolToObject(o, "prerelease", mine && R->prerelease);
+    cJSON_AddStringToObject(o, "board", R->board);
+    cJSON_AddStringToObject(o, "type", R->type);
+    cJSON_AddStringToObject(o, "model", R->model);
     cJSON_AddStringToObject(o, "current", cur);
     cJSON *a = cJSON_AddArrayToObject(o, "builds");
-    for (int i = 0; i < s.ncand; i++) {
-        const cand_t *c = &s.cand[i];
+    for (int i = 0; i < ncand; i++) {
+        const cand_t *c = &R->cand[i];
         cJSON *b = cJSON_CreateObject();
         cJSON_AddStringToObject(b, "name", c->a.name);
         cJSON_AddStringToObject(b, "version", c->n.version);
@@ -607,6 +700,7 @@ void fwcat_add_json(cJSON *root) {
     cJSON *dl = cJSON_AddObjectToObject(o, "download");
     static const char *const st[] = {"idle", "running", "done", "failed"};
     cJSON_AddStringToObject(dl, "state", st[s.dl]);
+    cJSON_AddNumberToObject(dl, "radio", s.radio);
     cJSON_AddStringToObject(dl, "name", s.dl_name);
     cJSON_AddNumberToObject(dl, "done", s.dl_done);
     cJSON_AddNumberToObject(dl, "total", s.dl_total);

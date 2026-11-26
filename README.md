@@ -8,7 +8,11 @@ that the stick plugs into instead. Run one network cable (with power over it, if
 PoE) to a central spot, and Zigbee2MQTT talks to the stick over the network as if it were still
 plugged in.
 
-It also keeps an eye on the link: a dashboard shows how Zigbee2MQTT and the stick are getting on,
+Add a powered USB hub and one bridge carries **up to four radios**, each on its own network port:
+Zigbee2MQTT, Home Assistant's ZHA, an OpenThread Border Router and Z-Wave JS can all sit in one good
+spot. Plug a stick in and it sets itself up.
+
+It also keeps an eye on the links: a dashboard shows how each app and its stick are getting on,
 which devices it hears and how well, and warns you about trouble.
 
 ![The bridge's dashboard: health, traffic, response time and the serial link](docs/screenshots/overview.png)
@@ -16,14 +20,20 @@ which devices it hears and how well, and warns you about trouble.
 ## What it does
 
 - **Bridges your stick to Zigbee2MQTT** over TCP, with nothing to install on the Home Assistant side.
+- **Up to four radios behind a USB hub**, one TCP port each: Zigbee2MQTT, ZHA, a Thread border router
+  (OpenThread RCP) and Z-Wave JS. A stick you plug in gets a radio by itself, with its role guessed from
+  what it is, its baud rate and a free port; settings change without a reboot. Unplug a stick nothing
+  uses and its radio goes away; a radio in use waits for its stick and tells you it's missing.
 - **Shows the link's health**: deliveries, response time, retries and errors, live and for the last
   24 hours.
-- **Lists every device the coordinator hears**, with signal, link quality and delivery rate.
+- **Shows every radio together or one at a time**: traffic, clients and events per radio, and every
+  device Zigbee2MQTT's coordinator hears, with signal, link quality and delivery rate.
 - **Updates itself** from this repository's releases, safely: a new version is checked before it's
   used, and the board goes back to the old one by itself if the new one doesn't start properly.
-- **Flashes your stick's own firmware** from the dashboard: upload a file or pick a build it finds
-  for your stick, and it checks the file before anything is written.
-- **Keeps a log** that survives reboots (in flash, and on a microSD card if you add one).
+- **Flashes each stick's own firmware** from the dashboard: upload a file or pick a build it finds
+  for that stick (Silicon Labs and TI), and it checks the file before anything is written.
+- **Keeps a log** that survives reboots (in flash, and on a microSD card if you add one; the card can
+  be formatted from the dashboard).
 - **Works with Zigbee Studio**, which shows the bridge's health next to your Zigbee network.
 
 | Devices it hears | Settings |
@@ -34,8 +44,11 @@ which devices it hears and how well, and warns you about trouble.
 
 - A **Waveshare ESP32-P4-POE-ETH** board (with the PoE module if you want power over the cable)
 - A short **MX1.25 4-pin to USB-A** adapter cable for the board's USB host port (J3)
-- A Zigbee USB stick. Tested with the **SONOFF Dongle Plus MG24**; other Silicon Labs (EmberZNet)
-  sticks work too, and TI, ConBee and nRF sticks are passed through as well.
+- A Zigbee USB stick. Tested with the **SONOFF Dongle Plus MG24** and the **SONOFF ZBDongle-P** (TI);
+  other Silicon Labs (EmberZNet) sticks work too, and ConBee and nRF sticks are passed through as well.
+- For more than one radio: a **powered USB hub** (USB 2.0 or 3.0 both work: the bridge runs it at full
+  speed, which the sticks behind it need) and a stick per radio: Thread RCP sticks for a border router,
+  Z-Wave sticks for Z-Wave JS.
 - A USB-C cable for the first flash
 
 ## Getting started
@@ -62,6 +75,21 @@ which devices it hears and how well, and warns you about trouble.
 
 Restart Zigbee2MQTT, and your devices are back, now through the bridge.
 
+### More radios
+
+Plug a powered USB hub into J3 and the sticks into the hub. Each new stick gets the next radio, its own
+TCP port (6639, 6640, 6641) and the allowed host of radio 1. **Settings → Radios** shows each radio's
+role, port and the exact setup for its app:
+
+| App | Where | What to enter |
+| --- | --- | --- |
+| Zigbee2MQTT | `configuration.yaml` | `port: tcp://<bridge>:<port>` and the adapter shown |
+| ZHA | Add integration → Zigbee Home Automation → enter manually | radio type, `socket://<bridge>:<port>`, port speed |
+| OpenThread Border Router | the add-on's configuration | `network_device: <bridge>:<port>`, baud rate |
+| Z-Wave JS | Settings → Z-Wave → serial port | `tcp://<bridge>:<port>` |
+
+Two Zigbee networks (Zigbee2MQTT and ZHA) should sit on different channels, away from your Wi-Fi's.
+
 ## Questions
 
 **What if the bridge reboots?** Zigbee2MQTT notices, waits a moment and reconnects by itself; a
@@ -70,12 +98,16 @@ reboot usually costs about ten to twenty seconds.
 **I set a wrong IP address and can't reach it.** Power it on and off five times in a row, each time
 for less than ten seconds. It forgets its settings and comes back on DHCP.
 
-**Can anyone on my network connect to my stick?** Only until you set the allowed Zigbee2MQTT host
-on the Settings page. After that the bridge refuses everyone else. The dashboard itself always needs
-your password.
+**Can anyone on my network connect to my stick?** Only until you set each radio's allowed host on the
+Settings page (a new radio starts with radio 1's). After that the bridge refuses everyone else. The
+dashboard itself always needs your password.
 
-**Where are the details?** Hardware pins, the API, the update process, flashing sticks, the stored
-log, watchdogs and tests are all in [the technical reference](docs/TECHNICAL.md).
+**What happens when I unplug a stick?** If no app ever connected to it, its radio simply goes away.
+If one did, the radio stays, shows the stick as missing and waits; plug it back into any hub port and
+the app reconnects. **Forget** frees a radio for good.
+
+**Where are the details?** Hardware pins, the API, radios and hubs, the update process, flashing
+sticks, memory, the stored log, watchdogs and tests are all in [the technical reference](docs/TECHNICAL.md).
 
 ## The Zigbee family
 
@@ -86,6 +118,19 @@ Zigbee Bridge is one of three apps that share one look:
 | [Zigbee Studio](https://github.com/home-controls/zigbee-studio) | A fast page for Zigbee2MQTT; shows this bridge's health too |
 | [Zigbee Sniffer](https://github.com/home-controls/zigbee-sniffer) | Listen to your network with small ESP32 radios |
 | **Zigbee Bridge** | This one: your coordinator on Ethernet |
+
+## How releases are made
+
+Every release is built by GitHub Actions from a tagged commit in this repository: the host tests
+run, the firmware is built, and the release files come with a `SHA256SUMS` file and a signed record of
+how and from which commit they were built. The bridge itself checks an update's size, MD5 and SHA-256
+before it switches to it, and goes back to the old version if the new one doesn't start properly. To
+check a download yourself, with the [GitHub CLI](https://cli.github.com/):
+
+```
+sha256sum -c SHA256SUMS
+gh attestation verify zigbee_eth_bridge-<version>-full.bin --repo home-controls/zigbee-bridge
+```
 
 ## License
 

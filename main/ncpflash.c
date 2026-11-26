@@ -59,7 +59,6 @@ typedef struct {
 static const esp_partition_t *s_part;
 static SemaphoreHandle_t s_lock;
 static img_hdr_t s_hdr;
-static nf_gbl_t s_gbl;
 static bool s_have;
 static img_kind_t s_kind;   // what the stored image is
 static char s_desc[96];     // its one-line summary (non-.gbl kinds)
@@ -128,7 +127,7 @@ static void hex(char *out, const uint8_t *d, size_t n) {
 }
 
 static void fmt_ncp(char *out, size_t n, uint8_t ezsp, uint16_t v) {
-    snprintf(out, n, "EZSP v%u, stack %u.%u.%u.%u", ezsp, (v >> 12) & 15, (v >> 8) & 15, (v >> 4) & 15, v & 15);
+    snprintf(out, n, "EmberZNet %u.%u.%u.%u (EZSP v%u)", (v >> 12) & 15, (v >> 8) & 15, (v >> 4) & 15, v & 15, ezsp);
 }
 
 // ---------------------------------------------------------------- io for the core
@@ -141,9 +140,9 @@ static int io_image_read(void *ctx, uint32_t off, uint8_t *buf, size_t len) {
 
 static int io_read(void *ctx, uint8_t *buf, size_t max, uint32_t timeout_ms) {
     (void)ctx;
-    if (!dongle_ready()) return -1;
+    if (!dongle_fl_ready()) return -1;
     size_t n = xStreamBufferReceive(dongle_claim_rx(), buf, max, pdMS_TO_TICKS(timeout_ms));
-    if (n == 0 && !dongle_ready()) return -1;
+    if (n == 0 && !dongle_fl_ready()) return -1;
     return (int)n;
 }
 
@@ -198,7 +197,7 @@ static void rts_dtr(void) {  // universal-silabs-flasher's rts_dtr pattern
 static int io_hw_reset(void *ctx, const char **how) {
     (void)ctx;
     dongle_info_t d;
-    dongle_info(&d);
+    dongle_fl_info(&d);
     switch (d.model->reset) {
         case RST_NONE:
             if (d.model->family != FAM_UNKNOWN) return -1;  // known board without one (e.g. SkyConnect)
@@ -294,6 +293,10 @@ typedef struct {
     int baud;
 } meta_t;
 
+// The stored .gbl's flags and metadata, parsed once when it's stored (not on every /api/dongle poll).
+static meta_t s_meta;
+static bool s_signed, s_encrypted;
+
 static void parse_meta(const nf_gbl_t *g, meta_t *m) {
     memset(m, 0, sizeof(*m));
     if (g->metadata[0] == 0 || g->metadata_cut) return;
@@ -312,17 +315,26 @@ static void parse_meta(const nf_gbl_t *g, meta_t *m) {
 
 // NULL, or why this image must not go on the coordinator. A different baud is fine: the bridge verifies
 // the new firmware at its baud and switches itself over (link_after).
+// The settings as the flash target radio sees them: its link baud, and CTS handshake only on radio 1 (the
+// other radios have none). Everything below that compares or saves baud / hw_flow goes through this.
+static void fl_cfg(bridge_settings_t *c) {
+    settings_get(c);
+    int r = dongle_fl_index();
+    if (r > 0 && r < RADIO_MAX) {
+        c->baud = c->radios[r].baud;
+        c->hw_flow = false;
+    }
+}
+
 static const char *meta_problem(const meta_t *m, uint32_t baud, char *buf, size_t n) {
     (void)baud;
-    bridge_settings_t cfg;
-    settings_get(&cfg);
-    bool thread = cfg.role == BRIDGE_ROLE_THREAD;
+    bool thread = settings_radio_role(dongle_fl_index()) == BRIDGE_ROLE_THREAD;
     const char *want = thread ? "openthread_rcp" : "zigbee_ncp";
     if (m->fw_type[0] && strcmp(m->fw_type, want) != 0) {
         if (strcmp(m->fw_type, "openthread_rcp") == 0 && !thread)
-            snprintf(buf, n, "This is OpenThread RCP firmware: set the dongle role to Thread (Settings) to use it with a border router");
+            snprintf(buf, n, "This is OpenThread RCP firmware: set the radio's role to Thread (Settings, Radios) to use it with a border router");
         else if (strcmp(m->fw_type, "zigbee_ncp") == 0 && thread)
-            snprintf(buf, n, "This is Zigbee coordinator firmware: set the dongle role to Zigbee (Settings) to use it with Zigbee2MQTT");
+            snprintf(buf, n, "This is Zigbee coordinator firmware: set the radio's role to Zigbee2MQTT or ZHA (Settings, Radios) to use it with Zigbee2MQTT");
         else
             snprintf(buf, n, "This is %s firmware, not a %s build (%s)", m->fw_type, thread ? "Thread RCP" : "Zigbee coordinator", want);
         return buf;
@@ -333,7 +345,7 @@ static const char *meta_problem(const meta_t *m, uint32_t baud, char *buf, size_
     }
     if (strcmp(m->flow, "hw_flow") == 0) {
         dongle_info_t d;
-        dongle_info(&d);
+        dongle_fl_info(&d);
         if (d.model->family != FAM_UNKNOWN && !d.model->hw_flow) {
             snprintf(buf, n, "This build needs RTS/CTS hardware flow control, which %s doesn't have wired", d.model->name);
             return buf;
@@ -368,33 +380,37 @@ static void load_image(void) {
     char desc[96] = "";
     const char *why = k == IMG_GBL ? nf_gbl_check(&s_io, h.size, &g) : xf_check(k, store_read, h.size, h.name, desc, sizeof(desc));
     if (why) {
-        ESP_LOGW(TAG, "Stored dongle image %s no longer checks out: %s", h.name, why);
+        ESP_LOGW(TAG, "Stored stick image %s no longer checks out: %s", h.name, why);
         return;
     }
+    meta_t m;
+    parse_meta(&g, &m);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_hdr = h;
-    s_gbl = g;
+    s_meta = m;
+    s_signed = g.is_signed;
+    s_encrypted = g.encrypted;
     s_kind = k;
     strlcpy(s_desc, desc, sizeof(s_desc));
     s_have = true;
     xSemaphoreGive(s_lock);
-    ESP_LOGI(TAG, "Stored dongle image: %s (%lu bytes)", h.name, (unsigned long)h.size);
+    ESP_LOGI(TAG, "Stored stick image: %s (%lu bytes)", h.name, (unsigned long)h.size);
 }
 
 const char *ncpflash_upload_begin(uint32_t size, const char *name) {
-    if (s_part == NULL) return "No flash area for dongle images";
+    if (s_part == NULL) return "No flash area for stick images";
     if (size < 64) return "The file is too small to be firmware";
-    if (size > AREA_SIZE - IMG_OFF) return "The file is too big for the dongle image area (2 MB)";
+    if (size > AREA_SIZE - IMG_OFF) return "The file is too big for the stick image area (2 MB)";
     dongle_info_t di;
-    dongle_info(&di);
+    dongle_fl_info(&di);
     img_kind_t kind = xf_kind_for(name ? name : "", di.model->family);
     if (kind == IMG_UNKNOWN) {
         size_t nl = name ? strlen(name) : 0;
         if (nl > 4 && strcasecmp(name + nl - 4, ".hex") == 0)
-            return "A .hex can be TI or Nordic firmware: plug in the dongle it's for first";
+            return "A .hex can be TI or Nordic firmware: plug in the stick it's for first";
         return "Upload a .gbl (Silicon Labs), .zip or .hex (TI Z-Stack), .GCF (ConBee) or .hex (nRF52840)";
     }
-    if (!busy_take()) return "The dongle is being flashed or another image is uploading";
+    if (!busy_take()) return "The stick is being flashed or another image is uploading";
     // Drop the old image first: from here on there is none until this one checks out.
     if (esp_partition_erase_range(s_part, 0, IMG_OFF) != ESP_OK) {
         busy_give();
@@ -465,9 +481,13 @@ const char *ncpflash_upload_end(bool complete) {
             memcmp(&h, &back, sizeof(h)) != 0) {
             fail = "Saving the image header failed";
         } else {
+            meta_t m;
+            parse_meta(&g, &m);
             xSemaphoreTake(s_lock, portMAX_DELAY);
             s_hdr = h;
-            s_gbl = g;
+            s_meta = m;
+            s_signed = g.is_signed;
+            s_encrypted = g.encrypted;
             s_kind = s_up.kind;
             strlcpy(s_desc, desc, sizeof(s_desc));
             s_have = true;
@@ -479,16 +499,16 @@ const char *ncpflash_upload_end(bool complete) {
     hex(m, md5, 16);
     if (fail) {
         snprintf(why, sizeof(why), "%s", fail);
-        stats_event(EV_WARN, "Dongle firmware %s refused: %s", s_up.name, why);
+        stats_event_r(dongle_fl_index(), EV_WARN, "Stick firmware %s refused: %s", s_up.name, why);
         return why;
     }
-    stats_event(EV_INFO, "Dongle firmware %s stored (%lu bytes, MD5 %s)", s_up.name, (unsigned long)s_up.size, m);
+    stats_event_r(dongle_fl_index(), EV_INFO, "Stick firmware %s stored (%lu bytes, MD5 %s)", s_up.name, (unsigned long)s_up.size, m);
     return NULL;
 }
 
 const char *ncpflash_delete(void) {
-    if (s_part == NULL) return "No flash area for dongle images";
-    if (!busy_take()) return "The dongle is being flashed or an image is uploading";
+    if (s_part == NULL) return "No flash area for stick images";
+    if (!busy_take()) return "The stick is being flashed or an image is uploading";
     esp_err_t e = esp_partition_erase_range(s_part, 0, IMG_OFF);
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_have = false;
@@ -514,12 +534,12 @@ static void xprogress(const char *step, uint32_t done, uint32_t total) { io_prog
 static void flash_other(const img_hdr_t *h, img_kind_t k, const bridge_settings_t *cfg) {
     char err[200] = "";
     if (!dongle_claim()) {
-        const char *why = dongle_ready() ? "The dongle is busy" : "No dongle connected";
-        stats_event(EV_ERROR, "Dongle firmware not flashed: %s", why);
+        const char *why = dongle_fl_ready() ? "The stick is busy" : "No stick connected";
+        stats_event_r(dongle_fl_index(), EV_ERROR, "Stick firmware not flashed: %s", why);
         finish(ST_FAILED, why);
         return;
     }
-    stats_event(EV_WARN, "Flashing %s firmware %s: the client is cut off until it's done", xf_kind_name(k), h->name);
+    stats_event_r(dongle_fl_index(), EV_WARN, "Flashing %s firmware %s: the client is cut off until it's done", xf_kind_name(k), h->name);
     vTaskDelay(pdMS_TO_TICKS(500));
     xf_result_t r;
     int64_t t0 = esp_timer_get_time();
@@ -538,23 +558,23 @@ static void flash_other(const img_hdr_t *h, img_kind_t k, const bridge_settings_
     xSemaphoreGive(s_lock);
     if (baud_change) {
         char serr[96] = "";
-        if (settings_save_link(r.link_baud, false, serr, sizeof(serr)) != ESP_OK)
-            stats_event(EV_ERROR, "New firmware is on, but saving the bridge's baud failed: %s", serr);
+        if (settings_save_link_radio(dongle_fl_index(), r.link_baud, false, serr, sizeof(serr)) != ESP_OK)
+            stats_event_r(dongle_fl_index(), EV_ERROR, "New firmware is on, but saving the bridge's baud failed: %s", serr);
         else
-            stats_event(EV_INFO, "Bridge baud set to %lu to match the new firmware", (unsigned long)r.link_baud);
+            stats_event_r(dongle_fl_index(), EV_INFO, "Bridge baud set to %lu to match the new firmware", (unsigned long)r.link_baud);
     }
     if (ok) {
-        if (r.after[0]) dongle_note_fw(r.after, "");
-        ESP_LOGI(TAG, "Dongle flashed in %lu s: %s -> %s", (unsigned long)secs, r.before[0] ? r.before : "?", r.after[0] ? r.after : "?");
-        stats_event(EV_INFO, "Dongle firmware flashed in %lu s%s%s%s%s", (unsigned long)secs, r.before[0] || r.after[0] ? ": " : "",
+        if (r.after[0]) dongle_fl_note_fw(r.after, "");
+        ESP_LOGI(TAG, "Stick flashed in %lu s: %s -> %s", (unsigned long)secs, r.before[0] ? r.before : "?", r.after[0] ? r.after : "?");
+        stats_event_r(dongle_fl_index(), EV_INFO, "Stick firmware flashed in %lu s%s%s%s%s", (unsigned long)secs, r.before[0] || r.after[0] ? ": " : "",
                     r.before, r.before[0] && r.after[0] ? " -> " : "", r.after);
         finish(ST_DONE, NULL);
     } else {
         const char *state = r.left_running ? "its previous firmware is still running"
                             : r.in_bootloader ? "it's in its bootloader: flash again"
                                               : "check it";
-        ESP_LOGE(TAG, "Dongle flash failed: %s (%s)", err, state);
-        stats_event(EV_ERROR, "Dongle flash failed: %s (%s)", err, state);
+        ESP_LOGE(TAG, "Stick flash failed: %s (%s)", err, state);
+        stats_event_r(dongle_fl_index(), EV_ERROR, "Stick flash failed: %s (%s)", err, state);
         finish(ST_FAILED, err);
     }
 }
@@ -567,7 +587,7 @@ static void flash_task(void *arg) {
     h = s_hdr;
     xSemaphoreGive(s_lock);
     bridge_settings_t cfg;
-    settings_get(&cfg);
+    fl_cfg(&cfg);
 
     // 1. The stored image again, from flash: header, MD5, structure, CRC-32, metadata.
     io_progress(NULL, "image", 0, h.size);
@@ -599,7 +619,7 @@ static void flash_task(void *arg) {
     }
     if (why) {
         ESP_LOGE(TAG, "Not flashing: %s", why);
-        stats_event(EV_ERROR, "Dongle firmware not flashed: %s", why);
+        stats_event_r(dongle_fl_index(), EV_ERROR, "Stick firmware not flashed: %s", why);
         finish(ST_FAILED, why);
         busy_give();
         vTaskDelete(NULL);
@@ -608,21 +628,21 @@ static void flash_task(void *arg) {
 
     // 2. Take the dongle from Zigbee2MQTT.
     if (!dongle_claim()) {
-        why = dongle_ready() ? "The dongle is busy" : "No dongle connected";
-        stats_event(EV_ERROR, "Dongle firmware not flashed: %s", why);
+        why = dongle_fl_ready() ? "The stick is busy" : "No stick connected";
+        stats_event_r(dongle_fl_index(), EV_ERROR, "Stick firmware not flashed: %s", why);
         finish(ST_FAILED, why);
         busy_give();
         vTaskDelete(NULL);
         return;
     }
-    stats_event(EV_WARN, "Flashing dongle firmware %s: Zigbee2MQTT is cut off until it's done", h.name);
+    stats_event_r(dongle_fl_index(), EV_WARN, "Flashing stick firmware %s: the radio's client is cut off until it's done", h.name);
     vTaskDelay(pdMS_TO_TICKS(500));  // the bridge drops Zigbee2MQTT within 250 ms
 
     // 3. Flash.
     nf_flash_opts_t o = {.app_baud = cfg.baud,
                          .new_baud = m.baud > 0 ? (uint32_t)m.baud : cfg.baud,
                          .upload_len = g.tag_len,
-                         .expect = cfg.role == BRIDGE_ROLE_THREAD ? NF_EXPECT_SPINEL : NF_EXPECT_EZSP};
+                         .expect = settings_radio_role(dongle_fl_index()) == BRIDGE_ROLE_THREAD ? NF_EXPECT_SPINEL : NF_EXPECT_EZSP};
     nf_result_t r;
     int64_t t0 = esp_timer_get_time();
     bool ok = nf_flash(&s_io, &o, &r, err, sizeof(err));
@@ -636,18 +656,18 @@ static void flash_task(void *arg) {
         if (lc.baud) nc.baud = lc.baud;
         if (lc.hw_flow >= 0) nc.hw_flow = lc.hw_flow == 1;
         char serr[96] = "";
-        if (settings_save_link(nc.baud, nc.hw_flow, serr, sizeof(serr)) != ESP_OK)
-            stats_event(EV_ERROR, "New firmware is on, but saving the bridge's new link settings failed: %s", serr);
+        if (settings_save_link_radio(dongle_fl_index(), nc.baud, nc.hw_flow, serr, sizeof(serr)) != ESP_OK)
+            stats_event_r(dongle_fl_index(), EV_ERROR, "New firmware is on, but saving the bridge's new link settings failed: %s", serr);
         if (lc.baud)
-            stats_event(EV_INFO, "Bridge baud set to %lu (was %lu) to match the new dongle firmware", (unsigned long)lc.baud,
+            stats_event_r(dongle_fl_index(), EV_INFO, "Bridge baud set to %lu (was %lu) to match the new stick firmware", (unsigned long)lc.baud,
                         (unsigned long)cfg.baud);
         if (lc.hw_flow >= 0) {
             char ferr[96] = "";
-            if (dongle_set_hw_flow(lc.hw_flow == 1, ferr, sizeof(ferr)) == ESP_OK)
-                stats_event(EV_INFO, "Hardware flow control (CTS) turned %s for the new %s firmware", lc.hw_flow ? "on" : "off",
+            if (dongle_fl_set_hw_flow(lc.hw_flow == 1, ferr, sizeof(ferr)) == ESP_OK)
+                stats_event_r(dongle_fl_index(), EV_INFO, "Hardware flow control (CTS) turned %s for the new %s firmware", lc.hw_flow ? "on" : "off",
                             m.flow);
             else
-                stats_event(EV_WARN, "The new firmware is %s, but the CTS handshake couldn't be turned on: %s", m.flow, ferr);
+                stats_event_r(dongle_fl_index(), EV_WARN, "The new firmware is %s, but the CTS handshake couldn't be turned on: %s", m.flow, ferr);
         }
     }
 
@@ -659,9 +679,9 @@ static void flash_task(void *arg) {
     else if (r.before_spinel[0]) strlcpy(before, r.before_spinel, sizeof(before));
     if (r.after_spinel[0]) {
         strlcpy(after, r.after_spinel, sizeof(after));
-        dongle_note_fw(r.after_spinel, "");
+        dongle_fl_note_fw(r.after_spinel, "");
     }
-    if (r.after.ok) {
+    if (r.after.ok && dongle_fl_index() == 0) {  // the EZSP identity shown is radio 0's (the decoder's)
         fmt_ncp(after, sizeof(after), r.after.ezsp_version, r.after.stack_version);
         stats_lock();
         g_stats.ezsp_version = r.after.ezsp_version;
@@ -670,15 +690,15 @@ static void flash_task(void *arg) {
         stats_unlock();
     }
     if (ok) {
-        ESP_LOGI(TAG, "Dongle flashed in %lu s: %s -> %s", (unsigned long)secs, before, after);
-        stats_event(EV_INFO, "Dongle firmware flashed in %lu s: %s -> %s", (unsigned long)secs, before, after);
+        ESP_LOGI(TAG, "Stick flashed in %lu s: %s -> %s", (unsigned long)secs, before, after);
+        stats_event_r(dongle_fl_index(), EV_INFO, "Stick firmware flashed in %lu s: %s -> %s", (unsigned long)secs, before, after);
         finish(ST_DONE, NULL);
     } else {
         const char *state = r.app_left_running ? "its previous firmware is still running"
                             : r.in_bootloader  ? "it's in its bootloader with no working firmware: flash again"
                                                : "check it";
-        ESP_LOGE(TAG, "Dongle flash failed: %s (%s)", err, state);
-        stats_event(EV_ERROR, "Dongle flash failed: %s (%s)", err, state);
+        ESP_LOGE(TAG, "Stick flash failed: %s (%s)", err, state);
+        stats_event_r(dongle_fl_index(), EV_ERROR, "Stick flash failed: %s (%s)", err, state);
         finish(ST_FAILED, err);
     }
     busy_give();
@@ -695,19 +715,19 @@ bool ncpflash_flash(const char *md5, char *why, size_t why_len) {
     char m[33];
     hex(m, h.md5, 16);
     if (!have) {
-        strlcpy(why, "No dongle firmware uploaded", why_len);
+        strlcpy(why, "No stick firmware uploaded", why_len);
         return false;
     }
     if (md5 == NULL || strcasecmp(md5, m) != 0) {
         strlcpy(why, "That isn't the stored image (MD5 differs): reload the page", why_len);
         return false;
     }
-    if (!dongle_ready()) {
-        strlcpy(why, "No dongle connected", why_len);
+    if (!dongle_fl_ready()) {
+        strlcpy(why, "No stick connected", why_len);
         return false;
     }
     dongle_info_t d;
-    dongle_info(&d);
+    dongle_fl_info(&d);
     img_kind_t k = kind_for_magic(h.magic);
     family_t want = xf_kind_family(k);
     if (d.model->family != want && d.model->family != FAM_UNKNOWN) {
@@ -715,14 +735,16 @@ bool ncpflash_flash(const char *md5, char *why, size_t why_len) {
                  d.model->radio, xf_kind_name(k));
         return false;
     }
-    bridge_settings_t rc;
-    settings_get(&rc);
-    if (k != IMG_GBL && rc.role == BRIDGE_ROLE_THREAD) {
-        snprintf(why, why_len, "%s firmware is Zigbee: set the dongle role to Zigbee first", xf_kind_name(k));
+    if (settings_radio_role(dongle_fl_index()) == BRIDGE_ROLE_ZWAVE) {
+        strlcpy(why, "Z-Wave radios are passed through: update a Z-Wave stick from Z-Wave JS", why_len);
+        return false;
+    }
+    if (k != IMG_GBL && settings_radio_role(dongle_fl_index()) == BRIDGE_ROLE_THREAD) {
+        snprintf(why, why_len, "%s firmware is Zigbee: set the radio's role to Zigbee2MQTT or ZHA first", xf_kind_name(k));
         return false;
     }
     if (!busy_take()) {
-        strlcpy(why, "The dongle is already being flashed", why_len);
+        strlcpy(why, "The stick is already being flashed", why_len);
         return false;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -745,17 +767,16 @@ bool ncpflash_flash(const char *md5, char *why, size_t why_len) {
 
 void ncpflash_add_json(cJSON *root) {
     img_hdr_t h;
-    nf_gbl_t *g = malloc(sizeof(nf_gbl_t));
     flash_state_t *fs = malloc(sizeof(flash_state_t));
-    if (!g || !fs) {
-        free(g);
-        free(fs);
-        return;
-    }
+    if (!fs) return;
     bool have;
+    meta_t m;
+    bool is_signed, encrypted;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     h = s_hdr;
-    *g = s_gbl;
+    m = s_meta;
+    is_signed = s_signed;
+    encrypted = s_encrypted;
     *fs = s_fs;
     have = s_have;
     img_kind_t kind = s_kind;
@@ -763,21 +784,23 @@ void ncpflash_add_json(cJSON *root) {
     strlcpy(desc, s_desc, sizeof(desc));
     xSemaphoreGive(s_lock);
     bridge_settings_t cfg;
-    settings_get(&cfg);
+    fl_cfg(&cfg);
 
     cJSON *d = cJSON_AddObjectToObject(root, "dongle_fw");
     cJSON_AddNumberToObject(d, "max_size", s_part ? AREA_SIZE - IMG_OFF : 0);
-    cJSON_AddNumberToObject(d, "baud", cfg.baud);
+    int fl = dongle_fl_index();
+    cJSON_AddNumberToObject(d, "radio", fl);
+    cJSON_AddNumberToObject(d, "baud", fl == 0 ? cfg.baud : cfg.radios[fl].baud);
     cJSON_AddBoolToObject(d, "busy", s_busy);
     stats_lock();
-    bool present = g_stats.dongle_open, z2m = g_stats.client_connected;
-    uint8_t ev = g_stats.ezsp_version;
-    uint16_t sv = g_stats.stack_version;
+    bool present = g_radio[fl].open, z2m = g_radio[fl].client_connected;
+    uint8_t ev = fl == 0 ? g_stats.ezsp_version : 0;  // the decoder only follows radio 0
+    uint16_t sv = fl == 0 ? g_stats.stack_version : 0;
     stats_unlock();
     cJSON_AddBoolToObject(d, "dongle", present);
     cJSON_AddBoolToObject(d, "z2m_connected", z2m);
     dongle_info_t di;
-    dongle_info(&di);
+    dongle_fl_info(&di);
     if (di.fw_running[0]) {  // Spinel / Z-Stack version read off the traffic (or the last flash)
         cJSON_AddStringToObject(d, "current", di.fw_running);
     } else if (ev) {
@@ -806,10 +829,8 @@ void ncpflash_add_json(cJSON *root) {
         // nothing .gbl-specific to add
     } else if (have) {
         cJSON *im = cJSON_GetObjectItem(d, "image");
-        cJSON_AddBoolToObject(im, "signed", g->is_signed);
-        cJSON_AddBoolToObject(im, "encrypted", g->encrypted);
-        meta_t m;
-        parse_meta(g, &m);
+        cJSON_AddBoolToObject(im, "signed", is_signed);
+        cJSON_AddBoolToObject(im, "encrypted", encrypted);
         if (m.fw_type[0]) cJSON_AddStringToObject(im, "fw_type", m.fw_type);
         if (m.ezsp[0]) cJSON_AddStringToObject(im, "version", m.ezsp);
         if (m.sdk[0]) cJSON_AddStringToObject(im, "sdk", m.sdk);
@@ -851,7 +872,6 @@ void ncpflash_add_json(cJSON *root) {
             cJSON_AddStringToObject(f, "dongle_left", fs->res.app_left_running ? "running" : fs->res.in_bootloader ? "bootloader" : "unknown");
         cJSON_AddNumberToObject(f, "retries", fs->res.retries);
     }
-    free(g);
     free(fs);
 }
 
@@ -903,7 +923,7 @@ static void store_test_task(void *arg) {
             }
         }
         esp_http_client_cleanup(h);
-        ESP_LOGW(TAG, "TEST dongle image %d: %s (%lld ms)", n, res ? res : "stored", (esp_timer_get_time() - t0) / 1000);
+        ESP_LOGW(TAG, "TEST stick image %d: %s (%lld ms)", n, res ? res : "stored", (esp_timer_get_time() - t0) / 1000);
         cJSON *r = cJSON_CreateObject();
         ncpflash_add_json(r);
         char *s = cJSON_PrintUnformatted(r);
@@ -916,7 +936,7 @@ static void store_test_task(void *arg) {
     bool ok = ncpflash_flash("00000000000000000000000000000000", why, sizeof(why));
     ESP_LOGW(TAG, "TEST flash with the wrong MD5: %s", ok ? "STARTED" : why);
     ok = ncpflash_flash(m, why, sizeof(why));
-    ESP_LOGW(TAG, "TEST flash with no dongle: %s", ok ? "STARTED" : why);
+    ESP_LOGW(TAG, "TEST flash with no stick: %s", ok ? "STARTED" : why);
     ESP_LOGW(TAG, "TEST done");
     vTaskDelete(NULL);
 }
@@ -933,12 +953,12 @@ void ncpflash_start(void) {
         esp_err_t e = esp_partition_register_external(NULL, AREA_OFFSET, AREA_SIZE, AREA_LABEL, ESP_PARTITION_TYPE_DATA,
                                                       AREA_SUBTYPE, &s_part);
         if (e != ESP_OK) {
-            ESP_LOGE(TAG, "No dongle image area: %s", esp_err_to_name(e));
+            ESP_LOGE(TAG, "No stick image area: %s", esp_err_to_name(e));
             s_part = NULL;
             return;
         }
     }
-    ESP_LOGI(TAG, "Dongle image area at 0x%lx, %lu KB", (unsigned long)s_part->address, (unsigned long)(s_part->size / 1024));
+    ESP_LOGI(TAG, "Stick image area at 0x%lx, %lu KB", (unsigned long)s_part->address, (unsigned long)(s_part->size / 1024));
     load_image();
 #ifdef CONFIG_BRIDGE_TEST_HOOKS
     if (CONFIG_BRIDGE_TEST_DONGLE_URL[0]) xTaskCreate(store_test_task, "dfw_test", 6144, NULL, 4, NULL);

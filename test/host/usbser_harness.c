@@ -6,6 +6,8 @@
 
 #include "dongles.h"
 #include "protodetect.h"
+
+static void t_ezsp_version(void);
 #include "usbser_core.h"
 
 static int g_fail;
@@ -163,6 +165,35 @@ static void t_detect(void) {
     pd_reset(&s);
     feed_all(&s, 1, sp, sizeof(sp));
     CHECK(feed_all(&s, 1, sp + 1, sizeof(sp) - 1) == PROTO_SPINEL, "spinel");
+    // Z-Wave Serial API: FUNC_ID_ZW_GET_VERSION request (01 03 00 15 E9), the stick's ACK, then its response
+    // "Z-Wave 7.18" + library type 01, checksum computed here independently.
+    const uint8_t zw_req[] = {0x01, 0x03, 0x00, 0x15, 0xE9};
+    uint8_t zw_rsp[32] = {0x06, 0x01, 0, 0x01, 0x15};
+    const char *ver = "Z-Wave 7.18";
+    size_t vn = strlen(ver) + 1;  // with its NUL
+    memcpy(zw_rsp + 5, ver, vn);
+    zw_rsp[5 + vn] = 0x01;
+    zw_rsp[2] = (uint8_t)(3 + vn + 1);  // len: itself, type, cmd, data
+    uint8_t ck = 0xFF;
+    for (size_t i = 2; i < 6 + vn; i++) ck ^= zw_rsp[i];
+    zw_rsp[6 + vn] = ck;
+    size_t zw_rsp_n = 7 + vn;
+    pd_reset(&s);
+    CHECK(feed_all(&s, 0, zw_req, sizeof(zw_req)) == PROTO_UNKNOWN, "one z-wave frame isn't enough");
+    CHECK(feed_all(&s, 1, zw_rsp, zw_rsp_n) == PROTO_ZWAVE, "zwave request + ack + response");
+    uint8_t zw_bad[sizeof(zw_req)];
+    memcpy(zw_bad, zw_req, sizeof(zw_req));
+    zw_bad[4] ^= 1;
+    pd_reset(&s);
+    feed_all(&s, 0, zw_bad, sizeof(zw_bad));
+    CHECK(feed_all(&s, 0, zw_bad, sizeof(zw_bad)) == PROTO_UNKNOWN, "zwave with a bad checksum is ignored");
+    uint8_t zw_type[] = {0x01, 0x03, 0x02, 0x15, 0};  // type 02 is neither request nor response
+    zw_type[4] = (uint8_t)(0xFF ^ 0x03 ^ 0x02 ^ 0x15);
+    pd_reset(&s);
+    feed_all(&s, 0, zw_type, sizeof(zw_type));
+    CHECK(feed_all(&s, 0, zw_type, sizeof(zw_type)) == PROTO_UNKNOWN, "zwave frame type must be 00/01");
+    pd_reset(&s);
+    CHECK(feed_all(&s, 0, zg, sizeof(zg)) == PROTO_ZIGATE, "zigate frames (also start with 01) stay zigate");
     // Noise must not decide anything quickly
     uint8_t noise[4096];
     uint32_t r = 12345;
@@ -237,6 +268,119 @@ static void t_versions(void) {
     pd_ver_t w;
     pd_ver_reset(&w);
     CHECK(!pd_ver_feed(&w, z, sizeof(z)) && !w.znp_seen, "bad fcs ignored");
+    {
+        char run[80], ver[24];
+        CHECK(pd_ver_text(&v, run, sizeof(run), ver, sizeof(ver)), "text for what was learnt");
+        pd_ver_t zo;
+        pd_ver_reset(&zo);
+        zo.znp_seen = true;
+        zo.znp_product = 1;
+        zo.znp_major = 2;
+        zo.znp_minor = 7;
+        zo.znp_maint = 1;
+        zo.znp_revision = 20250321;
+        CHECK(pd_ver_text(&zo, run, sizeof(run), ver, sizeof(ver)) && strcmp(run, "Z-Stack 3.x.0 build 20250321") == 0 &&
+                  strcmp(ver, "20250321") == 0,
+              "Z-Stack 3.x.0 label: '%s' '%s'", run, ver);
+        char nm[16];
+        pd_znp_name(0, 2, 6, 3, nm, sizeof(nm));
+        CHECK(strcmp(nm, "1.2") == 0, "product 0 = 1.2 (%s)", nm);
+        pd_znp_name(2, 2, 7, 1, nm, sizeof(nm));
+        CHECK(strcmp(nm, "3.0.x") == 0, "product 2 = 3.0.x (%s)", nm);
+        pd_znp_name(7, 4, 1, 2, nm, sizeof(nm));
+        CHECK(strcmp(nm, "4.1.2") == 0, "unknown product: numbers (%s)", nm);
+        pd_ver_t e0;
+        pd_ver_reset(&e0);
+        CHECK(!pd_ver_text(&e0, run, sizeof(run), ver, sizeof(ver)) && run[0] == 0 && ver[0] == 0, "nothing known yet");
+    }
+    t_ezsp_version();
+}
+
+// ASH DATA frame around an EZSP payload: randomised, CRC-CCITT big-endian, reserved bytes escaped, 7E at the end.
+static size_t ash_frame(uint8_t control, const uint8_t *ezsp, size_t n, uint8_t *out) {
+    uint8_t raw[64];
+    size_t k = 0;
+    raw[k++] = control;
+    uint8_t seed = 0x42;
+    for (size_t i = 0; i < n; i++) {
+        raw[k++] = ezsp[i] ^ seed;
+        seed = (seed & 1) ? (uint8_t)((seed >> 1) ^ 0xB8) : (uint8_t)(seed >> 1);
+    }
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < k; i++) {
+        crc ^= (uint16_t)raw[i] << 8;
+        for (int b = 0; b < 8; b++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    raw[k++] = (uint8_t)(crc >> 8);
+    raw[k++] = (uint8_t)crc;
+    size_t o = 0;
+    for (size_t i = 0; i < k; i++) {
+        uint8_t c = raw[i];
+        if (c == 0x7E || c == 0x7D || c == 0x11 || c == 0x13 || c == 0x18 || c == 0x1A) {
+            out[o++] = 0x7D;
+            out[o++] = c ^ 0x20;
+        } else {
+            out[o++] = c;
+        }
+    }
+    out[o++] = 0x7E;
+    return o;
+}
+
+static void t_ezsp_version(void) {
+    uint8_t fr[160];
+    char run[80], ver[24];
+    // extended version response: seq 1, fc_lo 0x80 (response), fc_hi 0x01, frame id 0x0000, v19, type 2, stack 9.1.2.0
+    const uint8_t ext[] = {0x01, 0x80, 0x01, 0x00, 0x00, 19, 2, 0x20, 0x91};
+    pd_ver_t v;
+    pd_ver_reset(&v);
+    size_t n = ash_frame(0x01, ext, sizeof(ext), fr);
+    bool learnt = false;
+    for (size_t i = 0; i < n; i++) learnt |= pd_ver_feed(&v, fr + i, 1);  // byte by byte
+    CHECK(learnt && v.ezsp_seen && v.ezsp_version == 19 && v.ezsp_stack == 0x9120, "extended EZSP version (%u %04x)",
+          v.ezsp_version, v.ezsp_stack);
+    CHECK(pd_ver_text(&v, run, sizeof(run), ver, sizeof(ver)) && strcmp(run, "EmberZNet 9.1.2.0 (EZSP v19)") == 0 &&
+              strcmp(ver, "9.1.2.0") == 0,
+          "EmberZNet label: '%s' '%s'", run, ver);
+    CHECK(!pd_ver_feed(&v, fr, n), "same version again: nothing new");
+    // legacy response (the first `version` call): seq 0, fc 0x80, frame id 0x00, v13, type 2, stack 7.4.4.0
+    const uint8_t leg[] = {0x00, 0x80, 0x00, 13, 2, 0x40, 0x74};
+    pd_ver_t l;
+    pd_ver_reset(&l);
+    n = ash_frame(0x00, leg, sizeof(leg), fr);
+    CHECK(pd_ver_feed(&l, fr, n) && l.ezsp_version == 13 && l.ezsp_stack == 0x7440, "legacy EZSP version");
+    // a callback (fc 0x90) or a host command (fc 0x00) with the same bytes is not the version answer
+    const uint8_t cb[] = {0x01, 0x90, 0x01, 0x00, 0x00, 19, 2, 0x20, 0x91};
+    pd_ver_t c;
+    pd_ver_reset(&c);
+    n = ash_frame(0x01, cb, sizeof(cb), fr);
+    CHECK(!pd_ver_feed(&c, fr, n) && !c.ezsp_seen, "callback ignored");
+    // bad CRC
+    n = ash_frame(0x01, ext, sizeof(ext), fr);
+    fr[3] ^= 0x01;
+    pd_ver_reset(&c);
+    CHECK(!pd_ver_feed(&c, fr, n) && !c.ezsp_seen, "bad CRC ignored");
+    // XON/XOFF in the middle of the frame are flow control, not data
+    n = ash_frame(0x01, ext, sizeof(ext), fr);
+    uint8_t withx[170];
+    size_t m = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (i == 3) withx[m++] = 0x13;
+        withx[m++] = fr[i];
+        if (i == 5) withx[m++] = 0x11;
+    }
+    pd_ver_reset(&c);
+    CHECK(pd_ver_feed(&c, withx, m) && c.ezsp_version == 19, "XOFF/XON inside a frame skipped");
+    // an ASH ACK (control 0x81) right before doesn't confuse it
+    uint8_t two[180];
+    size_t k = 0;
+    two[k++] = 0x81;
+    two[k++] = 0x60;
+    two[k++] = 0x59;
+    two[k++] = 0x7E;
+    n = ash_frame(0x11, ext, sizeof(ext), two + k);
+    pd_ver_reset(&c);
+    CHECK(pd_ver_feed(&c, two, k + n) && c.ezsp_seen, "after an ACK");
 }
 
 int main(int argc, char **argv) {

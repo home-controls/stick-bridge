@@ -28,7 +28,9 @@ typedef struct {
 
 // Opens the device as the right kind of interface; cfg's callbacks are the caller's. FTDI forces one
 // max-packet per IN callback so the status bytes can be stripped (us_rx_fix).
-esp_err_t us_open(us_port_t *p, us_chip_t chip, uint16_t vid, uint16_t pid, const cdc_acm_host_device_config_t *cfg);
+// dev_addr: the USB address to open (CDC_HOST_ANY_DEV_ADDR = first match by VID:PID).
+esp_err_t us_open(us_port_t *p, us_chip_t chip, uint16_t vid, uint16_t pid, uint8_t dev_addr,
+                  const cdc_acm_host_device_config_t *cfg);
 void us_close(us_port_t *p);
 
 // Chip init, then baud, 8N1, no hardware flow control, DTR and RTS asserted: what Linux does when

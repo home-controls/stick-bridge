@@ -156,9 +156,9 @@ const char *nf_gbl_check(const nf_io_t *io, uint32_t size, nf_gbl_t *g) {
                 g->app_version = rd32(head + 4);
                 break;
             case GBL_BOOTLOADER:
-                return "This image replaces the dongle's bootloader: the bridge only flashes Zigbee firmware (use a PC for that)";
+                return "This image replaces the stick's bootloader: the bridge only flashes Zigbee firmware (use a PC for that)";
             case GBL_SE_UPGRADE:
-                return "This image upgrades the dongle's secure element: the bridge only flashes Zigbee firmware (use a PC for that)";
+                return "This image upgrades the stick's secure element: the bridge only flashes Zigbee firmware (use a PC for that)";
             case GBL_PROG:
             case GBL_ERASEPROG:
             case GBL_PROG_LZ4:
@@ -478,7 +478,7 @@ static bool launch_from_app(const nf_io_t *io, uint32_t baud, nf_ncp_t *before) 
     ash_t a;
     if (!ash_reset(io, &a, before)) return false;
     if (!ezsp_version(io, &a, before)) return false;
-    logf_(io, "Dongle firmware answers: EZSP v%u, stack %u.%u.%u.%u", before->ezsp_version, (before->stack_version >> 12) & 15,
+    logf_(io, "Stick firmware answers: EZSP v%u, stack %u.%u.%u.%u", before->ezsp_version, (before->stack_version >> 12) & 15,
           (before->stack_version >> 8) & 15, (before->stack_version >> 4) & 15, before->stack_version & 15);
     uint8_t mode = 0x01, r[40];  // STANDALONE_BOOTLOADER_NORMAL_MODE
     int n = ezsp_txn(io, &a, 0x008F, &mode, 1, r, sizeof(r), 1500);
@@ -579,7 +579,7 @@ bool nf_spinel_probe(const nf_io_t *io, uint32_t baud, char *ver, size_t vlen) {
 // without bootloader support just restart; the caller probes for the menu either way.
 static bool spinel_bootloader(const nf_io_t *io, uint32_t baud, char *ver, size_t vlen) {
     if (!nf_spinel_probe(io, baud, ver, vlen)) return false;
-    logf_(io, "Dongle firmware answers Spinel: %s", ver);
+    logf_(io, "Stick firmware answers Spinel: %s", ver);
     static const uint8_t reset_bl[] = {0x81, 0x01, 0x03};  // CMD_RESET, SPINEL_RESET_BOOTLOADER
     spinel_send(io, reset_bl, sizeof(reset_bl));
     return true;
@@ -623,7 +623,7 @@ static bool upload(const nf_io_t *io, uint32_t len, nf_result_t *r, char *err, s
     static const uint8_t one = '1';
     drain(io);
     if (io->write(io->ctx, &one, 1) != 0) {
-        seterr(err, el, "The dongle went away");
+        seterr(err, el, "The stick went away");
         return false;
     }
     // "begin upload", then 'C' once a second until the first block.
@@ -661,7 +661,7 @@ static bool upload(const nf_io_t *io, uint32_t len, nf_result_t *r, char *err, s
         int fails = 0;
         for (;;) {
             if (io->write(io->ctx, pkt, sizeof(pkt)) != 0) {
-                seterr(err, el, "The dongle went away during the upload (%lu%%)", (unsigned long)(off * 100 / len));
+                seterr(err, el, "The stick went away during the upload (%lu%%)", (unsigned long)(off * 100 / len));
                 return false;
             }
             uint8_t resp = 0;
@@ -669,7 +669,7 @@ static bool upload(const nf_io_t *io, uint32_t len, nf_result_t *r, char *err, s
             while (!elapsed(io, w0, XM_TIMEOUT_MS)) {
                 int rn = io->read(io->ctx, &resp, 1, left(io, w0, XM_TIMEOUT_MS));
                 if (rn < 0) {
-                    seterr(err, el, "The dongle went away during the upload (%lu%%)", (unsigned long)(off * 100 / len));
+                    seterr(err, el, "The stick went away during the upload (%lu%%)", (unsigned long)(off * 100 / len));
                     return false;
                 }
                 if (rn == 0) break;
@@ -745,7 +745,7 @@ static bool upload(const nf_io_t *io, uint32_t len, nf_result_t *r, char *err, s
         uint8_t d[64];
         int n = io->read(io->ctx, d, sizeof(d), w);
         if (n < 0) {
-            seterr(err, el, "The dongle went away after the upload");
+            seterr(err, el, "The stick went away after the upload");
             return false;
         }
         if (n > 0) text_add(&t, d, (size_t)n);
@@ -803,7 +803,7 @@ bool nf_flash(const nf_io_t *io, const nf_flash_opts_t *o, nf_result_t *r, char 
         int hr = 0;
         if (io->hw_reset) {
             hr = io->hw_reset(io->ctx, &how);
-            if (hr < 0) logf_(io, "This dongle has no hardware reset into its bootloader");
+            if (hr < 0) logf_(io, "This stick has no hardware reset into its bootloader");
         } else {
             logf_(io, "Trying the RTS/DTR reset into the bootloader");
             reset_into_bootloader(io);
@@ -814,7 +814,7 @@ bool nf_flash(const nf_io_t *io, const nf_flash_opts_t *o, nf_result_t *r, char 
         }
     }
     if (!in_bl) {
-        seterr(err, el, "Couldn't get the dongle into its bootloader (no EZSP answer at %lu baud and no bootloader menu)",
+        seterr(err, el, "Couldn't get the stick into its bootloader (no EZSP answer at %lu baud and no bootloader menu)",
                (unsigned long)o->app_baud);
         r->app_left_running = r->before.ok;
         return false;
@@ -857,7 +857,7 @@ bool nf_flash(const nf_io_t *io, const nf_flash_opts_t *o, nf_result_t *r, char 
     // 3. Run it and make sure it answers.
     progress(io, "start", 0, 0);
     if (!run_app(io)) {
-        seterr(err, el, "The dongle didn't start the new firmware (its bootloader is still showing)");
+        seterr(err, el, "The stick didn't start the new firmware (its bootloader is still showing)");
         r->in_bootloader = true;
         return false;
     }

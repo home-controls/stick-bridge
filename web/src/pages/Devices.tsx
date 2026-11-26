@@ -1,7 +1,9 @@
-// Devices the coordinator heard, from the traffic passing through: signal, link quality, delivery.
+// Devices the coordinator heard, from the traffic passing through: signal, link quality, delivery. Only radio 1's
+// EmberZNet traffic is decoded, so with several radios the other radios get a note and their own counters instead.
 
 import { useState } from "preact/hooks";
-import { devices, atUptime } from "../store";
+import { devices, atUptime, extraRadios, radioAt, radioPick, status } from "../store";
+import { RadioStatsCard, RadioSwitcher, ROLE_LABEL } from "./Radios";
 import { ago, matches, num, slStatus } from "../format";
 import { Chip, Empty, Lqi, Rssi, Search } from "../ui";
 import { Icon } from "../icons";
@@ -34,16 +36,38 @@ export function Devices() {
   const by = (k: Key) => setSort(sort.k === k ? { k, dir: sort.dir === 1 ? -1 : 1 } : { k, dir: k === "short" || k === "ieee" ? 1 : -1 });
   const weak = devices.value.filter((d) => d.rx && d.rssi_avg < -82).length;
   const failing = devices.value.filter((d) => succ(d) >= 0 && succ(d) < 0.9 && d.tx_ok + d.tx_fail >= 5).length;
+  const multi = extraRadios.value.length > 0;
+  const pick = radioPick.value;
+  const r0 = radioAt(0);
+  const r0zigbee = (r0?.role ?? status.value?.radios?.[0]?.role ?? "zigbee") === "zigbee";
+
+  // Another radio picked: its devices live in its own app; show its counters so the page isn't empty
+  const other = multi && pick !== null && pick !== 0 ? radioAt(pick) : undefined;
+  if (other) {
+    const app = other.role === "zha" ? "ZHA in Home Assistant" : other.role === "thread" ? "the border router (and the Thread apps on top of it)"
+      : other.role === "zwave" ? "Z-Wave JS" : "the Zigbee2MQTT that uses it";
+    return (
+      <div class="page">
+        <div class="page-head"><div><h1>Devices heard</h1><p class="lede">Radio {other.index + 1} · {other.name}</p></div></div>
+        <RadioSwitcher />
+        <p class="note"><Icon name="info" size={16} /> The bridge reads devices from radio 1's Zigbee2MQTT traffic only. Devices on {other.name}{other.name !== ROLE_LABEL[other.role] ? ` (${ROLE_LABEL[other.role]})` : ""} are in {app}.</p>
+        <div class="grid two"><RadioStatsCard r={other} /></div>
+      </div>
+    );
+  }
 
   return (
     <div class="page">
       <div class="page-head">
         <div>
           <h1>Devices heard</h1>
-          <p class="lede">{num(devices.value.length)} devices talked through this coordinator{weak ? ` · ${weak} with a weak last hop` : ""}{failing ? ` · ${failing} failing deliveries` : ""}</p>
+          <p class="lede">{multi ? `Radio 1 · ${r0?.name ?? "Zigbee"}: ` : ""}{num(devices.value.length)} devices talked through this coordinator{weak ? ` · ${weak} with a weak last hop` : ""}{failing ? ` · ${failing} failing deliveries` : ""}</p>
         </div>
         <div class="toolbar"><Search value={q} onInput={setQ} placeholder="Filter devices" /></div>
       </div>
+      <RadioSwitcher />
+      {multi && <p class="note"><Icon name="info" size={16} /> These devices come from radio 1 ({r0?.name ?? "Zigbee"}): the bridge decodes only its EmberZNet (Zigbee2MQTT) traffic. The other radios' devices are in their own apps.</p>}
+      {!r0zigbee && <p class="note"><Icon name="alert" size={16} /> Radio 1's role isn't Zigbee2MQTT: this table only fills from EmberZNet traffic.</p>}
       <p class="note"><Icon name="info" size={16} /> Signal and LQI are the last hop into the coordinator, so a device behind a router shows that router's link. Names live in Zigbee2MQTT and Zigbee Studio.</p>
       {devices.value.length === 0 ? (
         <div class="card"><Empty>No Zigbee traffic yet. Devices appear once Zigbee2MQTT is connected and they send something.</Empty></div>

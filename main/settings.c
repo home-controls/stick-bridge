@@ -23,12 +23,20 @@ static const char *NS = "cfg";
 
 static bridge_settings_t s_cfg;
 static bridge_settings_t s_boot;  // what this boot runs with (network, port, baud apply at boot)
-static uint32_t s_allow_addr, s_allow_mask;
+static uint32_t s_allow_addr[RADIO_MAX], s_allow_mask[RADIO_MAX];  // network order
+static radio_ident_t s_bound[RADIO_MAX];  // each radio's saved stick (NVS rb0..rb3)
+static bool s_su[RADIO_MAX];              // set up: a client has connected to it (NVS r%d_su)
+static uint32_t s_gen[RADIO_MAX];         // bumped when a radio is adopted or freed
+static uint32_t s_present;                // bit i: radio i has its stick right now (dongle.c)
 static uint8_t s_pw_salt[PW_SALT_LEN], s_pw_hash[PW_HASH_LEN];
 static bool s_has_pw;
+static volatile uint32_t s_pw_gen;  // bumped whenever the password changes (cached Basic logins drop)
 static uint8_t s_tok_hash[32];
 static bool s_has_tok;
-static SemaphoreHandle_t s_lock;
+static SemaphoreHandle_t s_lock;   // short: guards the fields above
+static SemaphoreHandle_t s_wlock;  // one writer at a time (save, adopt, free, set up); taken before s_lock
+
+static void apply_allow(const bridge_settings_t *c);
 
 static void defaults(bridge_settings_t *c) {
     memset(c, 0, sizeof(*c));
@@ -53,31 +61,272 @@ static void defaults(bridge_settings_t *c) {
     c->fw_prerelease = true;
     strlcpy(c->update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, sizeof(c->update_url));
     c->update_auto = true;
+    for (int i = 0; i < RADIO_MAX; i++) radio_link_default(i, &c->radios[i]);
+    c->usb_fs_only = true;
 }
 
+// radios[0] is the flat link above under another name.
+static void sync_radio0(bridge_settings_t *c) {
+    radio_link_t *r = &c->radios[0];
+    r->tcp_port = c->tcp_port;
+    r->baud = c->baud;
+    r->role = c->role;
+    strlcpy(r->allow, c->allow, sizeof(r->allow));
+}
+
+static void key(char *out, int radio, const char *what) { snprintf(out, 16, "r%d_%s", radio, what); }
+
 bool settings_parse_allow(const char *s, uint32_t *addr, uint32_t *mask) {
-    if (s == NULL || s[0] == '\0') {
-        *addr = 0;
-        *mask = 0;
-        return true;
-    }
-    unsigned a, b, c, d, n = 32;
-    char tail;
-    int got = sscanf(s, "%u.%u.%u.%u/%u%c", &a, &b, &c, &d, &n, &tail);
-    if (got == 4 && strchr(s, '/') != NULL) return false;
-    if ((got != 4 && got != 5) || a > 255 || b > 255 || c > 255 || d > 255 || n > 32) return false;
-    uint32_t host_mask = n == 0 ? 0 : 0xFFFFFFFFu << (32 - n);
-    uint32_t host_addr = ((a << 24) | (b << 16) | (c << 8) | d) & host_mask;
-    *addr = htonl(host_addr);
-    *mask = htonl(host_mask);
+    uint32_t a, m;
+    if (!radio_parse_allow(s, &a, &m)) return false;
+    *addr = htonl(a);
+    *mask = htonl(m);
     return true;
 }
 
-bool settings_allow_peer(uint32_t peer) {
+bool settings_allow_peer_radio(int radio, uint32_t peer) {
+    if (radio < 0 || radio >= RADIO_MAX) return false;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    bool ok = (peer & s_allow_mask) == s_allow_addr;
+    bool ok = (peer & s_allow_mask[radio]) == s_allow_addr[radio];
     xSemaphoreGive(s_lock);
     return ok;
+}
+
+bool settings_allow_peer(uint32_t peer) { return settings_allow_peer_radio(0, peer); }
+
+void settings_radio_slots(radio_slot_t out[RADIO_MAX]) {
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < RADIO_MAX; i++) out[i].bound = s_bound[i];
+    xSemaphoreGive(s_lock);
+}
+
+// Caller holds s_lock.
+static uint32_t shown_mask_locked(void) {
+    uint32_t m = 1u | s_present;
+    for (int i = 0; i < RADIO_MAX; i++)
+        if (s_su[i]) m |= 1u << i;
+    return m;
+}
+
+uint32_t settings_radio_shown_mask(void) {
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint32_t m = shown_mask_locked();
+    xSemaphoreGive(s_lock);
+    return m;
+}
+
+void settings_radio_present(int radio, bool present) {
+    if (radio < 0 || radio >= RADIO_MAX) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (present) s_present |= 1u << radio;
+    else s_present &= ~(1u << radio);
+    xSemaphoreGive(s_lock);
+}
+
+uint32_t settings_radio_gen(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) return 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint32_t g = s_gen[radio];
+    xSemaphoreGive(s_lock);
+    return g;
+}
+
+bool settings_radio_is_set_up(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) return false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool v = s_su[radio];
+    xSemaphoreGive(s_lock);
+    return v;
+}
+
+static void nvs_link(nvs_handle_t h, int i, const radio_link_t *r) {
+    char k[16];
+    snprintf(k, sizeof(k), "r%d_name", i);
+    nvs_set_str(h, k, r->name);
+    if (i == 0) return;  // the rest of radio 0 is the flat link
+    snprintf(k, sizeof(k), "r%d_port", i);
+    nvs_set_u16(h, k, r->tcp_port);
+    snprintf(k, sizeof(k), "r%d_allow", i);
+    nvs_set_str(h, k, r->allow);
+    snprintf(k, sizeof(k), "r%d_baud", i);
+    nvs_set_u32(h, k, r->baud);
+    snprintf(k, sizeof(k), "r%d_role", i);
+    nvs_set_u8(h, k, r->role);
+}
+
+static void nvs_su(nvs_handle_t h, int i, bool su) {
+    char k[16];
+    snprintf(k, sizeof(k), "r%d_su", i);
+    nvs_set_u8(h, k, su ? 1 : 0);
+}
+
+static void nvs_bound(nvs_handle_t h, int i, const radio_ident_t *id) {
+    char k[16];
+    snprintf(k, sizeof(k), "rb%d", i);
+    if (radio_ident_empty(id)) nvs_erase_key(h, k);
+    else nvs_set_blob(h, k, id, sizeof(*id));
+}
+
+void settings_radio_mark_set_up(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) return;
+    xSemaphoreTake(s_wlock, portMAX_DELAY);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool bound = !radio_ident_empty(&s_bound[radio]);  // freed meanwhile (its stick left): nothing to set up
+    xSemaphoreGive(s_lock);
+    if (bound && !settings_radio_is_set_up(radio)) {
+        nvs_handle_t h;
+        if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) {
+            nvs_su(h, radio, true);
+            nvs_commit(h);
+            nvs_close(h);
+        }
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_su[radio] = true;
+        xSemaphoreGive(s_lock);
+        ESP_LOGI(TAG, "Radio %d is set up (a client connected)", radio + 1);
+    }
+    xSemaphoreGive(s_wlock);
+}
+
+void settings_radio_adopt(int radio, const radio_ident_t *id, radio_kind_t kind, uint32_t model_baud) {
+    if (radio < 0 || radio >= RADIO_MAX) return;
+    xSemaphoreTake(s_wlock, portMAX_DELAY);
+    radio_link_t links[RADIO_MAX], fresh;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    memcpy(links, s_cfg.radios, sizeof(links));
+    uint32_t shown = shown_mask_locked() & ~(1u << radio);
+    xSemaphoreGive(s_lock);
+    if (radio != 0) radio_fresh_link(radio, kind, model_baud, links, shown, &fresh);
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_bound(h, radio, id);
+        nvs_su(h, radio, false);
+        if (radio != 0) nvs_link(h, radio, &fresh);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_bound[radio] = *id;
+    s_su[radio] = false;
+    s_gen[radio]++;
+    if (radio != 0) s_cfg.radios[radio] = fresh;
+    apply_allow(&s_cfg);
+    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_wlock);
+}
+
+void settings_radio_free(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) return;
+    radio_ident_t none;
+    memset(&none, 0, sizeof(none));
+    xSemaphoreTake(s_wlock, portMAX_DELAY);
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_bound(h, radio, &none);
+        nvs_su(h, radio, false);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_bound[radio] = none;
+    s_su[radio] = false;
+    s_gen[radio]++;
+    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_wlock);
+}
+
+void settings_radio_bind(int radio, const radio_ident_t *id) {
+    if (radio < 0 || radio >= RADIO_MAX) return;
+    char k[16];
+    snprintf(k, sizeof(k), "rb%d", radio);
+    (void)k;
+    xSemaphoreTake(s_wlock, portMAX_DELAY);
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_bound(h, radio, id);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_bound[radio] = *id;
+    xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_wlock);
+}
+
+uint8_t settings_radio_role(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) radio = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint8_t r = radio == 0 ? s_cfg.role : s_cfg.radios[radio].role;
+    xSemaphoreGive(s_lock);
+    return r;
+}
+
+void settings_radio_name(int radio, char *out, size_t n) {
+    if (radio < 0 || radio >= RADIO_MAX) radio = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    strlcpy(out, s_cfg.radios[radio].name, n);
+    xSemaphoreGive(s_lock);
+}
+
+uint16_t settings_radio_port(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) radio = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint16_t p = radio == 0 ? s_cfg.tcp_port : s_cfg.radios[radio].tcp_port;
+    xSemaphoreGive(s_lock);
+    return p;
+}
+
+uint32_t settings_radio_baud(int radio) {
+    if (radio < 0 || radio >= RADIO_MAX) radio = 0;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint32_t b = radio == 0 ? s_cfg.baud : s_cfg.radios[radio].baud;
+    xSemaphoreGive(s_lock);
+    return b;
+}
+
+// Allowed hosts of every radio from c into the lookup used for each connection (caller holds s_lock).
+static void apply_allow(const bridge_settings_t *c) {
+    for (int i = 0; i < RADIO_MAX; i++) {
+        const char *a = i == 0 ? c->allow : c->radios[i].allow;
+        if (!settings_parse_allow(a, &s_allow_addr[i], &s_allow_mask[i])) s_allow_addr[i] = s_allow_mask[i] = 0;
+    }
+}
+
+// 1.x -> 2.0, once: radios turn on by themselves now, so a radio with a saved stick was in use (it counts as
+// set up and waits for its stick), the old on/off keys go, and a port that clashed with a radio that was off
+// moves.
+static void migrate_v2(void) {
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READWRITE, &h) != ESP_OK) return;
+    uint8_t v = 0;
+    if (nvs_get_u8(h, "rsv", &v) == ESP_OK && v >= 2) {
+        nvs_close(h);
+        return;
+    }
+    bool bound[RADIO_MAX], was_on[RADIO_MAX];
+    char k[16];
+    for (int i = 0; i < RADIO_MAX; i++) {
+        bound[i] = !radio_ident_empty(&s_bound[i]);
+        uint8_t on = 0;
+        key(k, i, "on");
+        was_on[i] = i == 0 || (nvs_get_u8(h, k, &on) == ESP_OK && on != 0);
+    }
+    uint32_t moved = radio_migrate_v2(s_cfg.radios, bound, was_on, s_su);
+    for (int i = 0; i < RADIO_MAX; i++) {
+        nvs_su(h, i, s_su[i]);
+        key(k, i, "on");
+        nvs_erase_key(h, k);
+        if ((moved >> i) & 1u) {
+            nvs_link(h, i, &s_cfg.radios[i]);
+            ESP_LOGW(TAG, "Radio %d: link adjusted for 2.0: TCP %u, allowed host '%s'", i + 1, s_cfg.radios[i].tcp_port,
+                     s_cfg.radios[i].allow);
+        }
+    }
+    nvs_set_u8(h, "rsv", 2);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "Radio settings moved to 2.0 (set up: %s%s%s%s)", s_su[0] ? "1 " : "", s_su[1] ? "2 " : "",
+             s_su[2] ? "3 " : "", s_su[3] ? "4" : "");
 }
 
 static void load(void) {
@@ -112,6 +361,33 @@ static void load(void) {
         nvs_get_str(h, "upd_url", s_cfg.update_url, &len);
         uint8_t ua;
         if (nvs_get_u8(h, "upd_auto", &ua) == ESP_OK) s_cfg.update_auto = ua != 0;
+        uint8_t fs;
+        if (nvs_get_u8(h, "usb_fs", &fs) == ESP_OK) s_cfg.usb_fs_only = fs != 0;
+        char k[16];
+        for (int i = 0; i < RADIO_MAX; i++) {
+            radio_link_t *r = &s_cfg.radios[i];
+            key(k, i, "name");
+            len = sizeof(r->name);
+            nvs_get_str(h, k, r->name, &len);
+            snprintf(k, sizeof(k), "rb%d", i);
+            len = sizeof(s_bound[i]);
+            if (nvs_get_blob(h, k, &s_bound[i], &len) != ESP_OK || len != sizeof(s_bound[i]))
+                memset(&s_bound[i], 0, sizeof(s_bound[i]));
+            s_bound[i].serial[sizeof(s_bound[i].serial) - 1] = 0;
+            uint8_t su;
+            key(k, i, "su");
+            s_su[i] = nvs_get_u8(h, k, &su) == ESP_OK && su != 0;
+            if (i == 0) continue;  // the rest of radio 0 is the flat link
+            key(k, i, "port");
+            nvs_get_u16(h, k, &r->tcp_port);
+            key(k, i, "allow");
+            len = sizeof(r->allow);
+            nvs_get_str(h, k, r->allow, &len);
+            key(k, i, "baud");
+            nvs_get_u32(h, k, &r->baud);
+            key(k, i, "role");
+            nvs_get_u8(h, k, &r->role);
+        }
         len = sizeof(s_pw_salt);
         size_t hl = sizeof(s_pw_hash);
         s_has_pw = nvs_get_blob(h, "pw_salt", s_pw_salt, &len) == ESP_OK && len == PW_SALT_LEN &&
@@ -120,15 +396,29 @@ static void load(void) {
         s_has_tok = nvs_get_blob(h, "tok_hash", s_tok_hash, &tl) == ESP_OK && tl == sizeof(s_tok_hash);
         nvs_close(h);
     }
-    if (!settings_parse_allow(s_cfg.allow, &s_allow_addr, &s_allow_mask)) {
+    uint32_t a, m;
+    if (!settings_parse_allow(s_cfg.allow, &a, &m)) {
         ESP_LOGW(TAG, "Saved Z2M host '%s' is invalid; allowing anyone", s_cfg.allow);
         s_cfg.allow[0] = '\0';
-        s_allow_addr = s_allow_mask = 0;
     }
+    for (int i = 1; i < RADIO_MAX; i++) {
+        if (!settings_parse_allow(s_cfg.radios[i].allow, &a, &m)) {
+            ESP_LOGW(TAG, "Radio %d: saved host '%s' is invalid; allowing anyone", i + 1, s_cfg.radios[i].allow);
+            s_cfg.radios[i].allow[0] = '\0';
+        }
+        if (s_cfg.radios[i].role > RADIO_ROLE_MAX) s_cfg.radios[i].role = RADIO_ROLE_ZHA;
+    }
+    if (s_cfg.role > RADIO_ROLE_MAX || s_cfg.role == RADIO_ROLE_ZHA) s_cfg.role = RADIO_ROLE_ZIGBEE;
+    sync_radio0(&s_cfg);
+    migrate_v2();
+    uint32_t g0 = esp_random() | 1u;  // differs across boots: a page loaded before a reboot can't match by chance
+    for (int i = 0; i < RADIO_MAX; i++) s_gen[i] = g0 + (uint32_t)i * 0x10000u;
+    apply_allow(&s_cfg);
 }
 
 void settings_init(void) {
     s_lock = xSemaphoreCreateMutex();
+    s_wlock = xSemaphoreCreateMutex();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -145,6 +435,7 @@ void settings_init(void) {
 void settings_get(bridge_settings_t *out) {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     *out = s_cfg;
+    memcpy(out->gen, s_gen, sizeof(out->gen));
     xSemaphoreGive(s_lock);
 }
 
@@ -163,7 +454,10 @@ static bool valid_mask(uint32_t m) {
     return h != 0 && ((~h + 1) & ~h) == 0;  // contiguous ones from the top
 }
 
-esp_err_t settings_save(const bridge_settings_t *in, bool *reboot_needed, char *err, size_t err_len) {
+esp_err_t settings_save(const bridge_settings_t *in_raw, bool *reboot_needed, char *err, size_t err_len) {
+    bridge_settings_t in_copy = *in_raw;
+    bridge_settings_t *in = &in_copy;
+    sync_radio0(in);
     uint32_t aa, am;
     if (!valid_hostname(in->hostname)) {
         snprintf(err, err_len, "Hostname: lowercase letters, digits and '-' (1-31)");
@@ -219,12 +513,25 @@ esp_err_t settings_save(const bridge_settings_t *in, bool *reboot_needed, char *
             return ESP_ERR_INVALID_ARG;
         }
     }
-    if (in->role > BRIDGE_ROLE_THREAD) {
-        snprintf(err, err_len, "Role is zigbee or thread");
+    if (in->role > RADIO_ROLE_MAX) {
+        snprintf(err, err_len, "Role is zigbee, thread or zwave");
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_wlock, portMAX_DELAY);
+    // A radio a stick took (or that was freed) since the caller read the settings keeps what it has now.
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 1; i < RADIO_MAX; i++)
+        if (in->gen[i] != s_gen[i]) in->radios[i] = s_cfg.radios[i];
+    memcpy(in->gen, s_gen, sizeof(in->gen));
+    uint32_t shown = shown_mask_locked();
+    xSemaphoreGive(s_lock);
+    if (!radio_check_links(in->radios, shown, err, err_len)) {
+        xSemaphoreGive(s_wlock);
         return ESP_ERR_INVALID_ARG;
     }
     if (in->xoff_max_ms < 1 || in->xoff_max_ms > 200) {
         snprintf(err, err_len, "XOFF hold limit must be 1-200 ms");
+        xSemaphoreGive(s_wlock);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -232,6 +539,7 @@ esp_err_t settings_save(const bridge_settings_t *in, bool *reboot_needed, char *
     esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
     if (e != ESP_OK) {
         snprintf(err, err_len, "NVS open failed: %s", esp_err_to_name(e));
+        xSemaphoreGive(s_wlock);
         return e;
     }
     nvs_set_str(h, "hostname", in->hostname);
@@ -253,10 +561,13 @@ esp_err_t settings_save(const bridge_settings_t *in, bool *reboot_needed, char *
     nvs_set_u8(h, "role", in->role);
     nvs_set_str(h, "upd_url", in->update_url);
     nvs_set_u8(h, "upd_auto", in->update_auto ? 1 : 0);
+    nvs_set_u8(h, "usb_fs", in->usb_fs_only ? 1 : 0);
+    for (int i = 0; i < RADIO_MAX; i++) nvs_link(h, i, &in->radios[i]);
     e = nvs_commit(h);
     nvs_close(h);
     if (e != ESP_OK) {
         snprintf(err, err_len, "NVS commit failed: %s", esp_err_to_name(e));
+        xSemaphoreGive(s_wlock);
         return e;
     }
 
@@ -265,15 +576,28 @@ esp_err_t settings_save(const bridge_settings_t *in, bool *reboot_needed, char *
     bool reboot = strcmp(in->hostname, b->hostname) != 0 || in->use_static != b->use_static ||
                   (in->use_static && (in->ip != b->ip || in->mask != b->mask || in->gw != b->gw ||
                                       in->dns != b->dns)) ||
-                  in->tcp_port != b->tcp_port || in->baud != b->baud;
+                  in->usb_fs_only != b->usb_fs_only;
     s_cfg = *in;
-    // The Z2M host applies to the next connection without a reboot.
-    s_allow_addr = aa;
-    s_allow_mask = am;
+    // Radio links apply live (web.c rebinds ports and switches bauds); allowed hosts on the next connection.
+    apply_allow(&s_cfg);
+    (void)aa;
+    (void)am;
     xSemaphoreGive(s_lock);
+    xSemaphoreGive(s_wlock);
     *reboot_needed = reboot;
-    ESP_LOGI(TAG, "Settings saved%s", reboot ? " (reboot to apply network/port/baud)" : "");
+    ESP_LOGI(TAG, "Settings saved%s", reboot ? " (reboot to apply the network settings)" : "");
     return ESP_OK;
+}
+
+esp_err_t settings_save_link_radio(int radio, uint32_t baud, bool hw_flow, char *err, size_t err_len) {
+    if (radio == 0) return settings_save_link(baud, hw_flow, err, err_len);
+    if (radio < 0 || radio >= RADIO_MAX) return ESP_ERR_INVALID_ARG;
+    bridge_settings_t c;
+    settings_get(&c);
+    c.radios[radio].baud = baud;
+    bool reboot = false;
+    (void)hw_flow;
+    return settings_save(&c, &reboot, err, err_len);
 }
 
 esp_err_t settings_save_link(uint32_t baud, bool hw_flow, char *err, size_t err_len) {
@@ -282,12 +606,7 @@ esp_err_t settings_save_link(uint32_t baud, bool hw_flow, char *err, size_t err_
     c.baud = baud;
     c.hw_flow = hw_flow;
     bool reboot = false;
-    esp_err_t e = settings_save(&c, &reboot, err, err_len);
-    if (e != ESP_OK) return e;
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_boot.baud = baud;  // already running at it
-    xSemaphoreGive(s_lock);
-    return ESP_OK;
+    return settings_save(&c, &reboot, err, err_len);
 }
 
 void settings_factory_reset(void) {
@@ -385,10 +704,13 @@ esp_err_t settings_set_password(const char *pw) {
     memcpy(s_pw_salt, salt, sizeof(salt));
     memcpy(s_pw_hash, hash, sizeof(hash));
     s_has_pw = true;
+    s_pw_gen++;
     xSemaphoreGive(s_lock);
     ESP_LOGI(TAG, "Admin password set");
     return ESP_OK;
 }
+
+uint32_t settings_password_gen(void) { return s_pw_gen; }
 
 bool settings_check_password(const char *pw) {
     uint8_t salt[PW_SALT_LEN], want[PW_HASH_LEN], got[PW_HASH_LEN];

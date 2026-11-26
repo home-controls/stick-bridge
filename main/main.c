@@ -5,6 +5,8 @@
 // every byte is also decoded passively for the dashboard on port 80.
 
 #include "bridge.h"
+#include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "dongle.h"
 #include "fwcat.h"
 #include "esp_app_desc.h"
@@ -78,7 +80,7 @@ static void confirm_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             // A supported dongle that was identified must also be open: a USB-layer regression on the
             // coordinator rolls back instead of stranding Zigbee2MQTT.
-            bool net = net_has_ip(), web = web_running(), dongle = dongle_ready() || !dongle_identified();
+            bool net = net_has_ip(), web = web_running(), dongle = dongle_ready() || !dongle_identified();  // radio 1's
             if (s >= TRIAL_MIN_S && net && web && dongle) {
                 esp_ota_mark_app_valid_cancel_rollback();
                 ESP_LOGI(TAG, "Firmware confirmed");
@@ -86,7 +88,7 @@ static void confirm_task(void *arg) {
                 break;
             }
             if (s >= TRIAL_MAX_S) {
-                ESP_LOGE(TAG, "Trial failed after %d s (network %s, dashboard %s, dongle %s): going back to the previous firmware",
+                ESP_LOGE(TAG, "Trial failed after %d s (network %s, dashboard %s, radio 1 stick %s): going back to the previous firmware",
                          TRIAL_MAX_S, net ? "up" : "DOWN", web ? "up" : "DOWN", dongle ? "open" : "NOT OPEN");
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_ota_mark_app_invalid_rollback_and_reboot();
@@ -96,6 +98,12 @@ static void confirm_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+// cJSON makes hundreds of small allocations per API answer (/api/status every 2 s): in PSRAM, not internal RAM (the
+// watchdog's low-memory check), with internal RAM when PSRAM is full or missing.
+static void *json_malloc(size_t n) {
+    return heap_caps_malloc_prefer(n, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_DEFAULT);
+}
+
 void app_main(void) {
     logbuf_init();
     ESP_LOGI(TAG, "Zigbee Ethernet bridge %s", esp_app_get_description()->version);
@@ -103,6 +111,8 @@ void app_main(void) {
     ESP_LOGE(TAG, "TEST BUILD: crashing at boot on purpose");
     abort();
 #endif
+    cJSON_Hooks hooks = {.malloc_fn = json_malloc, .free_fn = free};
+    cJSON_InitHooks(&hooks);
     stats_begin();
     sysinfo_init();
     settings_init();
@@ -118,13 +128,13 @@ void app_main(void) {
     // The trial-boot check starts before anything else that could hang: a new image that never gets its
     // dashboard up is rolled back within 2 minutes.
     xTaskCreate(confirm_task, "confirm", 3072, NULL, 3, NULL);
-    dongle_start(cfg.baud);
+    dongle_start(cfg.usb_fs_only);
     dongle_set_flow(cfg.tx_chunk, cfg.tx_gap_us, cfg.xoff_honor, cfg.xoff_max_ms);
     if (cfg.hw_flow) {
         char err[96];
         dongle_set_hw_flow(true, err, sizeof(err));  // remembered; applied when the dongle opens
     }
-    bridge_start(cfg.tcp_port);
+    bridge_start();
     ncpflash_start();
     fwcat_start();
     web_start();

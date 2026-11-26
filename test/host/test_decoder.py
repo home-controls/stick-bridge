@@ -288,7 +288,7 @@ def build(rnd: random.Random) -> Script:
     s.callback(0x00C4, struct.pack("<BH", 0x0B, 0x0D9A), 0)
     s.e["net_status"] += 1
     s.dev(0x0D9A)["route_err"] += 1
-    s.callback(0x0019, struct.pack("<I", 0x0090), 0)
+    s.callback(0x0019, struct.pack("<I", 0x0015), 0)  # EZSP v19: sl_status_t NETWORK_UP
     s.events.append("Zigbee network is up")
     s.callback(0x0024, struct.pack("<HQBBH", 0x9999, 0x00158D0001ABCDEF, 1, 0, 0x0000), 0)
     s.e["joins"] += 1
@@ -332,6 +332,8 @@ def write_trace(s: Script, path: Path) -> None:
 
 
 def wsl(p: Path) -> str:
+    if sys.platform != "win32":  # Linux (CI): run_all.py puts linux/wsl in front, paths stay as they are
+        return p.resolve().as_posix()
     return "/mnt/" + p.drive[0].lower() + p.as_posix()[2:]
 
 
@@ -419,6 +421,43 @@ def many_devices_trace(path: Path, n: int) -> Script:
     return s
 
 
+# stackStatusHandler: EZSP v14+ sends a 4-byte sl_status_t (NETWORK_UP 0x15, DOWN 0x16), older versions one
+# EmberStatus byte (0x90, 0x91). Before the version is seen, the length decides.
+# (EZSP version or None, params, want network_up_known, want network_up, want last event or None)
+STACK_CASES = [
+    (19, struct.pack("<I", 0x0015), 1, 1, "Zigbee network is up"),
+    (19, struct.pack("<I", 0x0016), 1, 0, "Zigbee network is DOWN"),
+    (19, struct.pack("<I", 0x0090), 0, 0, "Stack status 0x0090"),
+    (14, struct.pack("<I", 0x0015), 1, 1, "Zigbee network is up"),
+    (13, bytes([0x90]), 1, 1, "Zigbee network is up"),
+    (13, bytes([0x91]), 1, 0, "Zigbee network is DOWN"),
+    (13, bytes([0x15]), 0, 0, "Stack status 0x0015"),
+    (None, struct.pack("<I", 0x0015), 1, 1, "Zigbee network is up"),
+    (None, bytes([0x90]), 1, 1, "Zigbee network is up"),
+    (19, bytes([0x15]), 0, 0, None),  # cut short: ignored
+]
+
+
+def stack_trace(path: Path, version, params: bytes) -> None:
+    s = Script()
+    if version is not None:
+        s.ncp_data(bytes([0, 0x80, 0x00, version, 2]) + struct.pack("<H", 0x9120), 5_000)
+    s.callback(0x0019, params)
+    write_trace(s, path)
+
+
+def check_stack(exe: str, trace: Path) -> list[str]:
+    bad = []
+    for version, params, known, up, event in STACK_CASES:
+        stack_trace(trace, version, params)
+        got = run(exe, trace, 99999)
+        texts = [x["text"] for x in got["events"] if not x["text"].startswith("Coordinator:")]
+        have = (got["network_up_known"], got["network_up"], texts[-1] if texts else None)
+        if have != (known, up, event):
+            bad.append(f"stack status v{version} {params.hex()}: want {(known, up, event)}, got {have}")
+    return bad
+
+
 def main() -> None:
     exe = build_harness()
     trace = HERE / "trace.bin"
@@ -435,6 +474,7 @@ def main() -> None:
             got = run(exe, trace, feed_seed)
             if got["lock_violations"]:
                 problems.append(f"fuzz {seed}: lock taken twice")
+    problems += check_stack(exe, trace)
     s = many_devices_trace(trace, 250)  # more devices than the table holds (DEV_MAX 192)
     got = run(exe, trace, 99999)
     if len(got["devices"]) != 192 or got["zb_rx"] != 250:
@@ -448,7 +488,7 @@ def main() -> None:
         print(f"\n{len(problems)} mismatches")
         sys.exit(1)
     print("decoder: all counters, devices, events and history match (3 scripts x 6 feeds), fuzz survived, "
-          "device table overflow OK (ASan+UBSan clean)")
+          f"{len(STACK_CASES)} stack status cases, device table overflow OK (ASan+UBSan clean)")
 
 
 if __name__ == "__main__":

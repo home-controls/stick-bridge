@@ -1,6 +1,8 @@
 #include "bridge.h"
+#include "tasks.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "dongle.h"
@@ -16,112 +18,109 @@
 #include "lwip/sockets.h"
 #include "settings.h"
 #include "stats.h"
+#include "net.h"
 #include "watchdog.h"
 
 static const char *TAG = "bridge";
 
-static uint16_t s_port;
-static volatile int s_client = -1;
-static SemaphoreHandle_t s_lock;
-static volatile bool s_kick;
-static char s_kick_why[64];
-
-// Which protocol this session speaks (protodetect.c). The EZSP decoder only sees EZSP traffic: a dongle the
-// list says is EZSP is decoded from the first byte; for one it doesn't know, bytes are held until the
-// protocol is clear and replayed into the decoder if it's EZSP.
-static SemaphoreHandle_t s_pd_lock;
-static pd_state_t s_pd;
-static volatile bool s_pd_done, s_ezsp_on;
-static proto_t s_pd_expected;
 #define HOLD_MAX 1024
-static uint8_t s_hold[2][HOLD_MAX];
-static uint16_t s_hold_len[2];
-static pd_ver_t s_ver;  // fed with dongle -> host bytes (tx task only)
 
-// The first x.y.z in s ("SL-OPENTHREAD/2.6.1_GitHub-..." -> "2.6.1").
-static void first_version(const char *s, char *out, size_t n) {
-    out[0] = 0;
-    for (const char *p = s; *p; p++) {
-        if (*p >= '0' && *p <= '9' && (p == s || p[-1] == '/' || p[-1] == ' ' || p[-1] == 'v' || p[-1] == '-')) {
-            size_t k = 0;
-            int dots = 0;
-            while ((p[k] >= '0' && p[k] <= '9') || (p[k] == '.' && p[k + 1] >= '0' && p[k + 1] <= '9')) {
-                if (p[k] == '.') dots++;
-                if (k + 1 < n) out[k] = p[k];
-                k++;
-            }
-            if (dots >= 1) {
-                out[k < n ? k : n - 1] = 0;
-                return;
-            }
-            out[0] = 0;
-        }
-    }
-}
+// One radio's TCP side.
+typedef struct {
+    int idx;
+    dongle_t *d;
+    uint16_t port;  // the port lfd listens on (0 = none: the radio isn't shown)
+    uint16_t failed_port;  // last port a listen failed on (one event per port, not per retry)
+    bool listened;  // has listened before: later port changes are worth an event
+    uint16_t last_port;  // the port it last listened on
+    int lfd;
+    volatile int client;
+    // Held while the tx task sends on `client` and while the rx task swaps or closes it: the tx task never sends
+    // on a socket number that was closed and handed to another radio's new client meanwhile.
+    SemaphoreHandle_t send_lock;
+    volatile bool kick;
+    char kick_why[64];
+    bool dongle_was_ready;
+    uint32_t last_refused_ip, last_refused_s;
+    const char *last_refused_why;
 
-static void sniff_versions(const uint8_t *b, size_t n) {
-    if (!pd_ver_feed(&s_ver, b, n)) return;
+    // Which protocol this session speaks (protodetect.c). Radio 0's EZSP decoder only sees EZSP traffic: a
+    // dongle the list says is EZSP is decoded from the first byte; for one it doesn't know, bytes are held
+    // until the protocol is clear and replayed into the decoder if it's EZSP. Other radios only detect.
+    SemaphoreHandle_t pd_lock;
+    pd_state_t pd;
+    volatile bool pd_done, ezsp_on;
+    volatile bool sniff;  // version sniffing: until a version is learnt (Spinel, EZSP, Z-Stack)
+    proto_t pd_expected;
+    uint8_t (*hold)[HOLD_MAX];  // [2][HOLD_MAX], radio 0 only
+    uint16_t hold_len[2];
+    pd_ver_t ver;  // fed with dongle -> host bytes (tx task only)
+} link_t;
+
+static link_t s_l[RADIO_MAX];
+static char s_names[RADIO_MAX][2][12];  // task names live as long as the tasks (the task list keeps the pointer)
+static uint8_t s_hold0[2][HOLD_MAX];
+
+static void sniff_versions(link_t *l, const uint8_t *b, size_t n) {
+    if (!pd_ver_feed(&l->ver, b, n)) return;
     char run[80], ver[24];
-    if (s_ver.spinel_version[0]) {
-        first_version(s_ver.spinel_version, ver, sizeof(ver));
-        dongle_note_fw(s_ver.spinel_version, ver);
-        stats_event(EV_INFO, "Dongle firmware: %s", s_ver.spinel_version);
-    } else if (s_ver.znp_seen) {
-        snprintf(run, sizeof(run), "Z-Stack %u.%u.%u build %lu", s_ver.znp_major, s_ver.znp_minor, s_ver.znp_maint,
-                 (unsigned long)s_ver.znp_revision);
-        snprintf(ver, sizeof(ver), "%lu", (unsigned long)s_ver.znp_revision);
-        dongle_note_fw(run, ver);
-        stats_event(EV_INFO, "Dongle firmware: %s", run);
-    }
+    if (!pd_ver_text(&l->ver, run, sizeof(run), ver, sizeof(ver))) return;
+    dx_note_fw(l->d, run, ver);
+    l->sniff = false;  // known until the next session (a flash or a new client starts one)
+    stats_event(EV_INFO, "Radio %d firmware: %s", l->idx + 1, run);
 }
 
-static void session_begin(void) {
-    dongle_info_t d;
-    dongle_info(&d);
-    xSemaphoreTake(s_pd_lock, portMAX_DELAY);
-    pd_reset(&s_pd);
-    s_pd_done = false;
-    s_pd_expected = d.model->proto;
-    s_ezsp_on = s_pd_expected == PROTO_EZSP;
-    s_hold_len[0] = s_hold_len[1] = 0;
-    pd_ver_reset(&s_ver);
-    xSemaphoreGive(s_pd_lock);
-    dongle_note_proto(PROTO_UNKNOWN);
+static void session_begin(link_t *l) {
+    dongle_info_t di;
+    dx_info(l->d, &di);
+    xSemaphoreTake(l->pd_lock, portMAX_DELAY);
+    pd_reset(&l->pd);
+    l->pd_done = false;
+    l->pd_expected = di.model->proto;
+    l->ezsp_on = l->idx == 0 && l->pd_expected == PROTO_EZSP;
+    l->hold_len[0] = l->hold_len[1] = 0;
+    pd_ver_reset(&l->ver);
+    l->sniff = true;
+    xSemaphoreGive(l->pd_lock);
+    dx_note_proto(l->d, PROTO_UNKNOWN);
 }
 
-static void observe(ash_dir_t dir, const uint8_t *b, size_t n, int64_t now) {
-    if (s_pd_done) {  // decided: no lock needed
-        if (s_ezsp_on) ezsp_decode_feed(dir, b, n, now);
+static void observe(link_t *l, ash_dir_t dir, const uint8_t *b, size_t n, int64_t now) {
+    if (l->pd_done) {  // decided: no lock needed
+        if (l->ezsp_on) ezsp_decode_feed(dir, b, n, now);
         return;
     }
     int di = dir == DIR_HOST ? 0 : 1;
-    char msg[112] = "";
-    xSemaphoreTake(s_pd_lock, portMAX_DELAY);
-    if (!s_pd_done) {
-        proto_t p = pd_feed(&s_pd, di, b, n);
+    char msg[128] = "";
+    xSemaphoreTake(l->pd_lock, portMAX_DELAY);
+    if (!l->pd_done) {
+        proto_t p = pd_feed(&l->pd, di, b, n);
         if (p != PROTO_UNKNOWN) {
-            s_pd_done = true;
-            dongle_note_proto(p);
-            if (p == PROTO_EZSP && !s_ezsp_on) {
+            l->pd_done = true;
+            if (p != PROTO_SPINEL && p != PROTO_ZNP && p != PROTO_EZSP) l->sniff = false;  // no version to read
+            dx_note_proto(l->d, p);
+            if (l->idx == 0 && p == PROTO_EZSP && !l->ezsp_on) {
                 for (int k = 0; k < 2; k++)
-                    if (s_hold_len[k]) ezsp_decode_feed(k ? DIR_NCP : DIR_HOST, s_hold[k], s_hold_len[k], now);
-                s_ezsp_on = true;
+                    if (l->hold_len[k]) ezsp_decode_feed(k ? DIR_NCP : DIR_HOST, l->hold[k], l->hold_len[k], now);
+                l->ezsp_on = true;
             } else if (p != PROTO_EZSP) {
-                s_ezsp_on = false;
+                l->ezsp_on = false;
             }
-            if (s_pd_expected != PROTO_UNKNOWN && p != s_pd_expected)
-                snprintf(msg, sizeof(msg), "The dongle talks %s, not %s as expected for it", proto_name(p), proto_name(s_pd_expected));
-            else if (s_pd_expected == PROTO_UNKNOWN)
-                snprintf(msg, sizeof(msg), "Detected %s on the dongle%s%s", proto_name(p), proto_z2m_adapter(p)[0] ? ": Zigbee2MQTT adapter " : "",
-                         proto_z2m_adapter(p));
-        } else if (!s_ezsp_on) {
-            size_t room = HOLD_MAX - s_hold_len[di], k = n < room ? n : room;
-            memcpy(s_hold[di] + s_hold_len[di], b, k);
-            s_hold_len[di] += (uint16_t)k;
+            if (l->pd_expected != PROTO_UNKNOWN && p != l->pd_expected)
+                snprintf(msg, sizeof(msg), "Radio %d: the stick talks %s, not %s as expected for it", l->idx + 1,
+                         proto_name(p), proto_name(l->pd_expected));
+            else if (l->pd_expected == PROTO_UNKNOWN)
+                snprintf(msg, sizeof(msg), "Radio %d: the stick talks %s%s%s", l->idx + 1, proto_name(p),
+                         proto_z2m_adapter(p)[0] ? " (Zigbee2MQTT adapter " : "", proto_z2m_adapter(p)[0] ? proto_z2m_adapter(p) : "");
+            if (msg[0] && proto_z2m_adapter(p)[0] && l->pd_expected == PROTO_UNKNOWN) strlcat(msg, ")", sizeof(msg));
+        } else if (l->idx == 0 && !l->ezsp_on) {
+            size_t room = HOLD_MAX - l->hold_len[di], k = n < room ? n : room;
+            memcpy(l->hold[di] + l->hold_len[di], b, k);
+            l->hold_len[di] += (uint16_t)k;
         }
     }
-    if (s_ezsp_on) ezsp_decode_feed(dir, b, n, now);
-    xSemaphoreGive(s_pd_lock);
+    if (l->ezsp_on) ezsp_decode_feed(dir, b, n, now);
+    xSemaphoreGive(l->pd_lock);
     if (msg[0]) stats_event(EV_INFO, "%s", msg);
 }
 
@@ -134,50 +133,73 @@ static void fmt_duration(uint32_t s, char *out, size_t n) {
     else snprintf(out, n, "%lud%luh", (unsigned long)(s / 86400), (unsigned long)(s % 86400 / 3600));
 }
 
-void bridge_kick_client(const char *why) {
-    strlcpy(s_kick_why, why, sizeof(s_kick_why));
-    s_kick = true;
+void bridge_kick_radio(int radio, const char *why) {
+    if (radio < 0 || radio >= RADIO_MAX) return;
+    link_t *l = &s_l[radio];
+    strlcpy(l->kick_why, why, sizeof(l->kick_why));
+    l->kick = true;
 }
 
-// Only the accept/receive task closes the client socket.
-static void drop_client(const char *why) {
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    int fd = s_client;
-    s_client = -1;
-    xSemaphoreGive(s_lock);
+void bridge_kick_client(const char *why) { bridge_kick_radio(0, why); }
+
+// Only the accept/receive task closes a client socket.
+// Who a radio's client is, for events. Read each time: a rename or role change shows without a reboot.
+static void who(const link_t *l, char *out, size_t n) {
+    char name[16];
+    uint8_t role = settings_radio_role(l->idx);
+    if (l->idx == 0) {
+        strlcpy(out, role == RADIO_ROLE_THREAD ? "Border router" : role == RADIO_ROLE_ZWAVE ? "Z-Wave JS" : "Zigbee2MQTT", n);
+        return;
+    }
+    settings_radio_name(l->idx, name, sizeof(name));
+    snprintf(out, n, "Radio %d (%s) client", l->idx + 1, name[0] ? name : radio_role_name(role));
+}
+
+static void drop_client(link_t *l, const char *why) {
+    int fd = l->client;
     if (fd < 0) return;
-    shutdown(fd, SHUT_RDWR);
+    shutdown(fd, SHUT_RDWR);  // ends a send the tx task may be blocked in, so the lock below comes free
+    xSemaphoreTake(l->send_lock, portMAX_DELAY);
+    l->client = -1;
     close(fd);
+    xSemaphoreGive(l->send_lock);
     char ip[16], dur[24];
     stats_lock();
-    ip_str(g_stats.client_ip, ip, sizeof(ip));
-    fmt_duration(stats_uptime_s() - g_stats.client_since_s, dur, sizeof(dur));
-    g_stats.client_connected = false;
-    g_stats.client_drops++;
+    radio_stats_t *rs = &g_radio[l->idx];
+    ip_str(rs->client_ip, ip, sizeof(ip));
+    fmt_duration(stats_uptime_s() - rs->client_since_s, dur, sizeof(dur));
+    rs->client_connected = false;
+    rs->client_drops++;
+    if (l->idx == 0) {
+        g_stats.client_connected = false;
+        g_stats.client_drops++;
+    }
     stats_unlock();
-    ESP_LOGW(TAG, "Client %s dropped: %s", ip, why);
-    stats_event(EV_WARN, "Zigbee2MQTT (%s) disconnected after %s: %s", ip, dur, why);
+    ESP_LOGW(TAG, "Radio %d: client %s dropped: %s", l->idx + 1, ip, why);
+    char w[64];
+    who(l, w, sizeof(w));
+    stats_event_r(l->idx, EV_WARN, "%s (%s) disconnected after %s: %s", w, ip, dur, why);
 }
 
-static int open_listener(void) {
+static int open_listener(link_t *l) {
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) return -1;
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(s_port), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(l->port), .sin_addr.s_addr = htonl(INADDR_ANY)};
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(fd, 2) != 0) {
-        ESP_LOGE(TAG, "Listen on %u failed: errno %d", s_port, errno);
+        ESP_LOGE(TAG, "Radio %d: listen on %u failed: errno %d", l->idx + 1, l->port, errno);
         close(fd);
         return -1;
     }
-    ESP_LOGI(TAG, "Listening for Zigbee2MQTT on TCP %u", s_port);
+    ESP_LOGI(TAG, "Radio %d: listening on TCP %u", l->idx + 1, l->port);
     return fd;
 }
 
 static void setup_client_socket(int fd) {
     int yes = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-    // Notice a Z2M host that vanished (power cut, cable) within ~25 s.
+    // Notice a client host that vanished (power cut, cable) within ~25 s.
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
     int idle = 10, intvl = 5, cnt = 3;
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
@@ -187,29 +209,27 @@ static void setup_client_socket(int fd) {
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-static void handle_accept(int lfd) {
+static void handle_accept(link_t *l) {
     struct sockaddr_in peer;
     socklen_t plen = sizeof(peer);
-    int fd = accept(lfd, (struct sockaddr *)&peer, &plen);
+    int fd = accept(l->lfd, (struct sockaddr *)&peer, &plen);
     if (fd < 0) return;
     uint32_t pip = peer.sin_addr.s_addr;
     char ip[16];
     ip_str(pip, ip, sizeof(ip));
 
-    static uint32_t last_refused_ip, last_refused_s;
-    static const char *last_refused_why;
     uint32_t now_s = stats_uptime_s();
     const char *refuse = NULL;
-    if (!settings_allow_peer(pip)) refuse = "not the configured Z2M host";
-    else if (!dongle_ready()) refuse = "no Zigbee dongle connected";
-    else if (dongle_claimed()) refuse = "the dongle's firmware is being updated";
+    if (!settings_allow_peer_radio(l->idx, pip)) refuse = "not this radio's allowed host";
+    else if (dx_claimed(l->d)) refuse = "the stick's firmware is being updated";
+    else if (!dx_ready(l->d)) refuse = "no stick connected to this radio";
 
-    if (refuse == NULL && s_client >= 0) {
+    if (refuse == NULL && l->client >= 0) {
         stats_lock();
-        uint32_t cur = g_stats.client_ip;
+        uint32_t cur = g_radio[l->idx].client_ip;
         stats_unlock();
         if (cur == pip) {
-            drop_client("replaced by a new connection from the same host");
+            drop_client(l, "replaced by a new connection from the same host");
         } else {
             refuse = "another client is connected";
         }
@@ -217,69 +237,132 @@ static void handle_accept(int lfd) {
     if (refuse) {
         close(fd);
         stats_lock();
-        g_stats.clients_refused++;
+        g_radio[l->idx].clients_refused++;
+        if (l->idx == 0) g_stats.clients_refused++;
         stats_unlock();
-        if (pip != last_refused_ip || refuse != last_refused_why || now_s - last_refused_s >= 30) {
-            last_refused_ip = pip;
-            last_refused_why = refuse;
-            last_refused_s = now_s;
-            stats_event(EV_WARN, "Refused TCP connection from %s: %s", ip, refuse);
+        if (pip != l->last_refused_ip || refuse != l->last_refused_why || now_s - l->last_refused_s >= 30) {
+            l->last_refused_ip = pip;
+            l->last_refused_why = refuse;
+            l->last_refused_s = now_s;
+            stats_event(EV_WARN, "Radio %d: refused TCP connection from %s: %s", l->idx + 1, ip, refuse);
         }
-        ESP_LOGW(TAG, "Refused %s: %s", ip, refuse);
+        ESP_LOGW(TAG, "Radio %d: refused %s: %s", l->idx + 1, ip, refuse);
         return;
     }
 
     setup_client_socket(fd);
-    dongle_flush_rx();
-    ezsp_decode_reset();
-    session_begin();
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_client = fd;
-    xSemaphoreGive(s_lock);
+    dx_flush_rx(l->d);
+    if (l->idx == 0) ezsp_decode_reset();
+    session_begin(l);
+    xSemaphoreTake(l->send_lock, portMAX_DELAY);
+    l->client = fd;
+    xSemaphoreGive(l->send_lock);
     stats_lock();
-    g_stats.client_connected = true;
-    g_stats.client_ip = pip;
-    g_stats.client_port = ntohs(peer.sin_port);
-    g_stats.client_since_s = now_s;
-    g_stats.clients_accepted++;
+    radio_stats_t *rs = &g_radio[l->idx];
+    rs->client_connected = true;
+    rs->client_ip = pip;
+    rs->client_port = ntohs(peer.sin_port);
+    rs->client_since_s = now_s;
+    rs->clients_accepted++;
+    if (l->idx == 0) {
+        g_stats.client_connected = true;
+        g_stats.client_ip = pip;
+        g_stats.client_port = ntohs(peer.sin_port);
+        g_stats.client_since_s = now_s;
+        g_stats.clients_accepted++;
+    }
     stats_unlock();
-    ESP_LOGI(TAG, "Zigbee2MQTT connected from %s:%u", ip, ntohs(peer.sin_port));
-    stats_event(EV_INFO, "Zigbee2MQTT connected from %s", ip);
+    ESP_LOGI(TAG, "Radio %d: client connected from %s:%u", l->idx + 1, ip, ntohs(peer.sin_port));
+    char w[64];
+    who(l, w, sizeof(w));
+    stats_event_r(l->idx, EV_INFO, "%s connected from %s", w, ip);
+    // From now on the radio is set up: if its stick goes, it waits for it (and says so) instead of being freed.
+    // Saved by the dongle task: this task's stack is in PSRAM, which can't write flash.
+    if (!settings_radio_is_set_up(l->idx)) dx_request_set_up(l->d);
 }
 
-// Accepts clients and moves Z2M -> dongle.
+static void client_to_stick(link_t *l, uint8_t *buf, size_t cap) {
+    int cfd = l->client;
+    int n = recv(cfd, buf, cap, 0);
+    if (n <= 0) {
+        drop_client(l, n == 0 ? "connection closed by the client" : "connection error");
+        return;
+    }
+    observe(l, DIR_HOST, buf, n, esp_timer_get_time());
+    esp_err_t e = dx_write(l->d, buf, n, 1000);
+    stats_lock();
+    radio_stats_t *rs = &g_radio[l->idx];
+    if (e == ESP_OK) {
+        rs->bytes_out += n;
+        rs->acc_out += n;
+    } else {
+        rs->tx_errors++;
+        if (l->idx == 0) g_stats.dongle_tx_errors++;
+    }
+    stats_unlock();
+    if (e != ESP_OK) ESP_LOGW(TAG, "Radio %d: write to stick failed: %s", l->idx + 1, esp_err_to_name(e));
+}
+
+// Listens on the radio's port (following its settings), accepts clients and moves client -> stick, one task per
+// radio (a slow or stalled stick only holds up its own client, never Zigbee2MQTT's).
 static void rx_task(void *arg) {
-    (void)arg;
-    int lfd = -1;
+    link_t *l = arg;
     uint8_t buf[1024];
-    bool dongle_was_ready = false;
     watchdog_task_add();
     for (;;) {
         watchdog_feed();
 #ifdef CONFIG_BRIDGE_TEST_HOOKS
-        if (g_wd_test_stall) vTaskDelay(pdMS_TO_TICKS(30000));  // not fed: the task watchdog must fire
+        if (g_wd_test_stall && l->idx == 0) vTaskDelay(pdMS_TO_TICKS(30000));  // not fed: the task watchdog must fire
 #endif
-        if (lfd < 0) {
-            lfd = open_listener();
-            if (lfd < 0) {
+        // The port follows the radio: none while it isn't shown, and a new one as soon as its settings change.
+        uint16_t want = (settings_radio_shown_mask() >> l->idx) & 1u ? settings_radio_port(l->idx) : 0;
+        if (l->lfd >= 0 && want != l->port) {
+            if (l->client >= 0) drop_client(l, want ? "the radio's TCP port changed" : "the radio was removed");
+            close(l->lfd);
+            l->lfd = -1;
+            ESP_LOGI(TAG, "Radio %d: stopped listening on TCP %u", l->idx + 1, l->port);
+            if (!want) net_set_ports();
+        }
+        if (want == 0) {
+            l->port = 0;
+            l->kick = false;
+            l->dongle_was_ready = false;
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+        if (l->lfd < 0) {
+            bool changed = l->listened && want != l->last_port;
+            l->port = want;
+            l->lfd = open_listener(l);
+            if (l->lfd < 0) {
+                if (l->failed_port != want) {
+                    l->failed_port = want;
+                    stats_event(EV_ERROR, "Radio %d: can't listen on TCP %u (errno %d); trying again", l->idx + 1, want, errno);
+                }
                 vTaskDelay(pdMS_TO_TICKS(2000));
                 continue;
             }
+            l->failed_port = 0;
+            if (changed) stats_event(EV_INFO, "Radio %d: now listening on TCP %u", l->idx + 1, want);
+            l->listened = true;
+            l->last_port = want;
+            net_set_ports();
         }
-        if (s_kick) {
-            s_kick = false;
-            if (s_client >= 0) drop_client(s_kick_why);
+        if (l->kick) {
+            l->kick = false;
+            if (l->client >= 0) drop_client(l, l->kick_why);
         }
-        bool ready = dongle_ready();
-        if (dongle_was_ready && !ready && s_client >= 0) drop_client("the Zigbee dongle went away");
-        if (dongle_claimed() && s_client >= 0) drop_client("the dongle's firmware is being updated");
-        dongle_was_ready = ready;
+        bool ready = dx_ready(l->d);
+        if (l->dongle_was_ready && !ready && l->client >= 0)
+            drop_client(l, "the stick went away");
+        if (dx_claimed(l->d) && l->client >= 0) drop_client(l, "the stick's firmware is being updated");
+        l->dongle_was_ready = ready;
 
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(lfd, &rfds);
-        int maxfd = lfd;
-        int cfd = s_client;
+        FD_SET(l->lfd, &rfds);
+        int maxfd = l->lfd;
+        int cfd = l->client;
         if (cfd >= 0) {
             FD_SET(cfd, &rfds);
             if (cfd > maxfd) maxfd = cfd;
@@ -292,62 +375,68 @@ static void rx_task(void *arg) {
             continue;
         }
         if (r == 0) continue;
-        if (FD_ISSET(lfd, &rfds)) handle_accept(lfd);
-        if (cfd >= 0 && cfd == s_client && FD_ISSET(cfd, &rfds)) {
-            int n = recv(cfd, buf, sizeof(buf), 0);
-            if (n <= 0) {
-                drop_client(n == 0 ? "connection closed by Zigbee2MQTT" : "connection error");
-                continue;
-            }
-            observe(DIR_HOST, buf, n, esp_timer_get_time());
-            esp_err_t e = dongle_write(buf, n, 1000);
-            if (e != ESP_OK) {
-                stats_lock();
-                g_stats.dongle_tx_errors++;
-                stats_unlock();
-                ESP_LOGW(TAG, "Write to dongle failed: %s", esp_err_to_name(e));
-            }
-        }
+        if (FD_ISSET(l->lfd, &rfds)) handle_accept(l);
+        if (cfd >= 0 && cfd == l->client && FD_ISSET(cfd, &rfds)) client_to_stick(l, buf, sizeof(buf));
     }
 }
 
-// Moves dongle -> Z2M.
+// Moves stick -> client, one task per radio.
 static void tx_task(void *arg) {
-    (void)arg;
+    link_t *l = arg;
     uint8_t buf[1024];
-    StreamBufferHandle_t sb = dongle_rx_stream();
+    StreamBufferHandle_t sb = dx_rx_stream(l->d);
     watchdog_task_add();
     for (;;) {
         watchdog_feed();
         size_t n = xStreamBufferReceive(sb, buf, sizeof(buf), pdMS_TO_TICKS(100));
         if (n == 0) continue;
-        int fd = s_client;
-        if (fd < 0) {
+        if (l->client < 0) {
             stats_lock();
-            g_stats.dropped_no_client += n;
+            g_radio[l->idx].dropped_no_client += n;
+            if (l->idx == 0) g_stats.dropped_no_client += n;
             stats_unlock();
             continue;
         }
-        observe(DIR_NCP, buf, n, esp_timer_get_time());
-        sniff_versions(buf, n);
+        observe(l, DIR_NCP, buf, n, esp_timer_get_time());
+        if (l->sniff) sniff_versions(l, buf, n);
+        stats_lock();
+        g_radio[l->idx].bytes_in += n;
+        g_radio[l->idx].acc_in += n;
+        stats_unlock();
+        xSemaphoreTake(l->send_lock, portMAX_DELAY);
+        int fd = l->client;  // read under the lock: still this radio's client while we send
         size_t off = 0;
-        while (off < n) {
+        while (fd >= 0 && off < n) {
             int w = send(fd, buf + off, n - off, 0);
             if (w <= 0) {
-                ESP_LOGW(TAG, "Send to Zigbee2MQTT failed: errno %d", errno);
+                ESP_LOGW(TAG, "Radio %d: send to client failed: errno %d", l->idx + 1, errno);
                 // Wake the receive task; it owns the close.
                 shutdown(fd, SHUT_RDWR);
                 break;
             }
             off += w;
         }
+        xSemaphoreGive(l->send_lock);
     }
 }
 
-void bridge_start(uint16_t port) {
-    s_port = port;
-    s_lock = xSemaphoreCreateMutex();
-    s_pd_lock = xSemaphoreCreateMutex();
-    xTaskCreate(rx_task, "tcp_rx", 6144, NULL, 8, NULL);
-    xTaskCreate(tx_task, "tcp_tx", 6144, NULL, 9, NULL);
+void bridge_start(void) {
+    for (int i = 0; i < RADIO_MAX; i++) {
+        link_t *l = &s_l[i];
+        memset(l, 0, sizeof(*l));
+        l->idx = i;
+        l->d = dongle_at(i);
+        l->lfd = -1;
+        l->client = -1;
+        l->pd_lock = xSemaphoreCreateMutex();
+        l->send_lock = xSemaphoreCreateMutex();
+        if (i == 0) l->hold = s_hold0;
+        // Every radio's tasks run from boot (a stick may turn up any time); an idle radio's just sleep.
+        snprintf(s_names[i][0], sizeof(s_names[i][0]), "tcp_tx%d", i);
+        snprintf(s_names[i][1], sizeof(s_names[i][1]), "tcp_rx%d", i);
+        // Stacks in PSRAM: these tasks never write flash (the one NVS write, a radio getting set up, is the
+        // dongle task's: dx_request_set_up).
+        task_start(tx_task, i == 0 ? "tcp_tx" : s_names[i][0], 6144, l, 9, true);  // up to 4.4 KB measured
+        task_start(rx_task, i == 0 ? "tcp_rx" : s_names[i][1], 6144, l, 8, true);
+    }
 }

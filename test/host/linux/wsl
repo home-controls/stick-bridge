@@ -1,0 +1,11 @@
+#!/bin/sh
+# Stands in for Windows' wsl command when the host tests run on Linux (run_all.py puts this folder
+# first on PATH there): drops "-d <distro>" and "--", then runs the rest as it is.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+exec "$@"

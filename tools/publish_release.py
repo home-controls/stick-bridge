@@ -1,12 +1,14 @@
 """Publishes the built firmware as a release the bridges update from (System page, Updates).
 
   python tools/publish_release.py --notes "What changed" --github
+  python tools/publish_release.py --notes-file notes.md --assets-only   # what CI does: files only
   python tools/publish_release.py --notes "What changed" [--repo ../zigbee-ota] [--commit] [--push]
 
 --github makes a GitHub release of this repo (gh CLI) with the three files below, which is where the
 bridge looks by default, plus zigbee_eth_bridge-<version>-full.bin (everything at 0x0, for a first flash
-with plain esptool) and dongles.json ([] unless release/<version>/ already has one); run it from ESP-IDF's
-environment, whose Python has esptool. Otherwise it writes them into <repo>/eth-bridge/ of a git checkout
+with plain esptool), dongles.json ([] unless release/<version>/ already has one) and SHA256SUMS (all of
+them); run it from ESP-IDF's environment, whose Python has esptool. --assets-only writes the same files to
+release/<version>/ and publishes nothing: the release workflow builds them and makes the release itself. Otherwise it writes them into <repo>/eth-bridge/ of a git checkout
 you serve:
   zigbee_eth_bridge-<version>.bin       the image (build/zigbee_eth_bridge.bin)
   zigbee_eth_bridge-<version>.bin.md5   "<md5>  <file>" (md5sum format)
@@ -57,15 +59,22 @@ def full_image(out: Path, version: str) -> Path:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--notes", required=True, help="what changed, shown on the bridge before installing")
+    notes = p.add_mutually_exclusive_group(required=True)
+    notes.add_argument("--notes", help="what changed, shown on the bridge before installing")
+    notes.add_argument("--notes-file", type=Path, help="the same, from a file (CHANGELOG.md's section: tools/release_info.py --notes)")
     p.add_argument("--repo", default=None, help="a git checkout serving the images (its eth-bridge/ folder), "
                    "else ZIGBEE_OTA, else ../zigbee-ota next to this repo")
     p.add_argument("--github", action="store_true", help="publish as a GitHub release of this repo instead (gh CLI): "
                    "the bridge's default update URL is releases/latest/download/manifest.json")
+    p.add_argument("--assets-only", action="store_true", help="write release/<version>/ (as --github would) and publish nothing")
     p.add_argument("--commit", action="store_true", help="git add + commit in the repo")
     p.add_argument("--push", action="store_true", help="git push after committing")
     a = p.parse_args()
-    if a.github and (a.repo or a.commit or a.push):
+    if a.notes_file:
+        a.notes = a.notes_file.read_text(encoding="utf-8")
+    if a.github and a.assets_only:
+        sys.exit("--github or --assets-only, not both")
+    if (a.github or a.assets_only) and (a.repo or a.commit or a.push):
         sys.exit("--github writes to release/ and publishes with gh: no --repo, --commit or --push")
     if len(a.notes.strip().encode()) > 500:
         sys.exit("keep --notes under 500 bytes: the bridge shows (and keeps) only that much")
@@ -80,7 +89,7 @@ def main() -> None:
     if "+" in version or "-" in version:
         sys.exit(f"{version} is a test build: releases are plain x.y.z")
 
-    if a.github:
+    if a.github or a.assets_only:
         out = HERE / "release" / version
     else:
         a.repo = a.repo or os.environ.get("ZIGBEE_OTA") or str(HERE.parent / "zigbee-ota")
@@ -92,17 +101,23 @@ def main() -> None:
     (out / name).write_bytes(data)
     (out / f"{name}.md5").write_text(f"{md5}  {name}\n", newline="\n")
     manifest = {"version": version, "file": name, "size": len(data), "md5": md5, "sha256": sha,
-                "date": datetime.date.today().isoformat(), "notes": a.notes.strip()}
+                "date": datetime.datetime.now(datetime.timezone.utc).date().isoformat(), "notes": a.notes.strip()}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", newline="\n")
     print(f"release {version}: {len(data)} bytes, md5 {md5}, sha256 {sha[:16]}...")
     print(f"wrote {out / name}, {name}.md5 and manifest.json")
 
-    if a.github:
+    if a.github or a.assets_only:
         full = full_image(out, version)
         dongles = out / "dongles.json"  # the bridge fetches it next to the manifest; [] = only the built-in list
         if not dongles.exists():
             dongles.write_text("[]\n", newline="\n")
-        files = [str(out / name), str(out / f"{name}.md5"), str(out / "manifest.json"), str(full), str(dongles)]
+        paths = [out / name, out / f"{name}.md5", out / "manifest.json", full, dongles]
+        sums = out / "SHA256SUMS"  # sha256sum -c SHA256SUMS
+        sums.write_text("".join(f"{hashlib.sha256(f.read_bytes()).hexdigest()}  {f.name}\n" for f in paths), newline="\n")
+        files = [str(f) for f in [*paths, sums]]
+        if a.assets_only:
+            print(f"wrote {len(files)} files to {out}")
+            return
         subprocess.run(["gh", "release", "create", f"v{version}", *files, "--title", f"Zigbee Bridge {version}",
                         "--notes", a.notes.strip()], check=True, cwd=HERE)
         print("published the GitHub release")

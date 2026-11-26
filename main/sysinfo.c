@@ -48,20 +48,29 @@ void sysinfo_add_json(cJSON *root) {
     cJSON_AddStringToObject(fw, "version", d->version);
     cJSON_AddStringToObject(fw, "project", d->project_name);
     cJSON_AddStringToObject(fw, "idf", esp_get_idf_version());
-    char built[40];
-    snprintf(built, sizeof(built), "%s %s", d->date, d->time);
+    // Fixed for this boot: built once. The trial state only ever goes from pending to confirmed, so once
+    // confirmed there's no need to read otadata from flash on every poll again.
+    static char built[40], chip[32];
+    static const esp_partition_t *run;
+    static bool confirmed;
+    if (!built[0]) {
+        snprintf(built, sizeof(built), "%s %s", d->date, d->time);
+        esp_chip_info_t ci;
+        esp_chip_info(&ci);
+        snprintf(chip, sizeof(chip), "ESP32-P4 rev %d.%d, %d cores", ci.revision / 100, ci.revision % 100, ci.cores);
+        run = esp_ota_get_running_partition();
+    }
     cJSON_AddStringToObject(fw, "built", built);
-    const esp_partition_t *run = esp_ota_get_running_partition();
     cJSON_AddStringToObject(fw, "partition", run ? run->label : "?");
-    esp_ota_img_states_t st;
-    bool pending = run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+    bool pending = false;
+    if (!confirmed) {
+        esp_ota_img_states_t st;
+        pending = run && esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY;
+        confirmed = !pending;
+    }
     cJSON_AddBoolToObject(fw, "pending_verify", pending);
 
     cJSON *sys = cJSON_AddObjectToObject(root, "sys");
-    esp_chip_info_t ci;
-    esp_chip_info(&ci);
-    char chip[32];
-    snprintf(chip, sizeof(chip), "ESP32-P4 rev %d.%d, %d cores", ci.revision / 100, ci.revision % 100, ci.cores);
     cJSON_AddStringToObject(sys, "chip", chip);
     cJSON_AddStringToObject(sys, "reset_reason", watchdog_last_reason()[0] ? "Watchdog" : reset_name(s_reset));
     cJSON_AddStringToObject(sys, "watchdog", watchdog_last_reason());

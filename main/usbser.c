@@ -77,26 +77,37 @@ static esp_err_t ft_baud(us_port_t *p, uint32_t baud) {
 
 // ---------------------------------------------------------------- common
 
-esp_err_t us_open(us_port_t *p, us_chip_t chip, uint16_t vid, uint16_t pid, const cdc_acm_host_device_config_t *cfg) {
+esp_err_t us_open(us_port_t *p, us_chip_t chip, uint16_t vid, uint16_t pid, uint8_t dev_addr,
+                  const cdc_acm_host_device_config_t *cfg) {
     memset(p, 0, sizeof(*p));
     p->chip = chip;
-    cdc_acm_host_device_config_t c = *cfg;
-    esp_err_t e;
+    // By USB address: two sticks behind a hub may share a VID:PID (two SONOFF MG24s), and an open by VID:PID
+    // alone hands back the first one that matches. The driver falls back from CDC descriptors to a plain pair
+    // of bulk endpoints by itself, so the vendor chips (CP210x, CH34x, FTDI) open the same way.
+    cdc_acm_host_open_config_t c = {
+        .vid = vid,
+        .pid = pid,
+        .interface_idx = 0,
+        .dev_addr = dev_addr,
+        .connection_timeout_ms = cfg->connection_timeout_ms,
+        .out_buffer_size = cfg->out_buffer_size,
+        .in_buffer_size = cfg->in_buffer_size,
+        .event_cb = cfg->event_cb,
+        .data_cb = cfg->data_cb,
+        .user_arg = cfg->user_arg,
+    };
     switch (chip) {
         case US_CP210X:
         case US_CH34X:
-            e = cdc_acm_host_open_vendor_specific(vid, pid, 0, &c, &p->h);
+        case US_CDC:
             break;
         case US_FTDI:
             c.in_buffer_size = 64;  // one packet per callback: each starts with 2 status bytes
-            e = cdc_acm_host_open_vendor_specific(vid, pid, 0, &c, &p->h);
-            break;
-        case US_CDC:
-            e = cdc_acm_host_open(vid, pid, 0, &c, &p->h);
             break;
         default:
             return ESP_ERR_NOT_SUPPORTED;
     }
+    esp_err_t e = cdc_acm_host_open(&c, &p->h);
     if (e != ESP_OK) p->h = NULL;
     return e;
 }

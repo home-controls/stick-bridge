@@ -33,8 +33,13 @@
 #define EZSP_INCOMING_ROUTE_ERROR_HANDLER 0x0080
 #define EZSP_INCOMING_NETWORK_STATUS_HANDLER 0x00C4
 
-#define SL_STATUS_NETWORK_UP 0x0090
-#define SL_STATUS_NETWORK_DOWN 0x0091
+// stackStatusHandler: from EZSP v14 (EmberZNet 8) an sl_status_t (4 bytes), before that one EmberStatus
+// byte (zigbee-herdsman ember/ezsp/buffalo.ts readStatus).
+#define EZSP_SL_STATUS_SINCE 14
+#define SL_STATUS_NETWORK_UP 0x0015
+#define SL_STATUS_NETWORK_DOWN 0x0016
+#define EMBER_NETWORK_UP 0x90
+#define EMBER_NETWORK_DOWN 0x91
 
 typedef struct {
     uint8_t buf[ASH_MAX_FRAME];
@@ -256,20 +261,21 @@ static void on_ezsp(ash_dir_t dir, const uint8_t *d, size_t n, bool retx, int64_
             break;
         }
         case EZSP_STACK_STATUS_HANDLER: {
-            if (pn >= 4) {
-                uint32_t status = rd32(&p[0]);
-                g->network_status = status;
-                if (status == SL_STATUS_NETWORK_UP) {
-                    g->network_up_known = true;
-                    g->network_up = true;
-                    ev(pe, EV_INFO, "Zigbee network is up");
-                } else if (status == SL_STATUS_NETWORK_DOWN) {
-                    g->network_up_known = true;
-                    g->network_up = false;
-                    ev(pe, EV_ERROR, "Zigbee network is DOWN");
-                } else {
-                    ev(pe, EV_INFO, "Stack status 0x%04lx", (unsigned long)status);
-                }
+            // version not seen yet (bridge started mid-session): the length tells the two apart
+            bool sl = g->ezsp_version ? g->ezsp_version >= EZSP_SL_STATUS_SINCE : pn >= 4;
+            if (pn < (sl ? 4u : 1u)) break;
+            uint32_t status = sl ? rd32(&p[0]) : p[0];
+            g->network_status = status;
+            if (status == (sl ? SL_STATUS_NETWORK_UP : EMBER_NETWORK_UP)) {
+                g->network_up_known = true;
+                g->network_up = true;
+                ev(pe, EV_INFO, "Zigbee network is up");
+            } else if (status == (sl ? SL_STATUS_NETWORK_DOWN : EMBER_NETWORK_DOWN)) {
+                g->network_up_known = true;
+                g->network_up = false;
+                ev(pe, EV_ERROR, "Zigbee network is DOWN");
+            } else {
+                ev(pe, EV_INFO, "Stack status 0x%04lx", (unsigned long)status);
             }
             break;
         }
@@ -299,6 +305,22 @@ static void on_ezsp(ash_dir_t dir, const uint8_t *d, size_t n, bool retx, int64_
         }
         default:
             break;
+    }
+}
+
+// The NCP acknowledged every host frame before ackNum: their ACK latency.
+static void acked(bridge_stats_t *g, uint8_t ack, int64_t now) {
+    for (int k = 1; k < 8; k++) {
+        int n = (ack - k) & 7;
+        if (s_ack_pending[n]) {
+            int64_t lat = now - s_ack_pending[n];
+            if (lat >= 0 && lat < 5000000) {
+                g->ack_sum_us += lat;
+                g->ack_n++;
+                if (lat > g->ack_max_us) g->ack_max_us = (uint32_t)lat;
+            }
+            s_ack_pending[n] = 0;
+        }
     }
 }
 
@@ -337,40 +359,18 @@ static void on_frame(ash_dir_t dir, ash_rx_t *rx, int64_t now, pending_event_t *
             if (!retx) s_ack_pending[frm] = now;
         } else {
             // DATA from the NCP also acknowledges host frames (ackNum = next expected)
-            for (int k = 1; k < 8; k++) {
-                int n = (ack - k) & 7;
-                if (s_ack_pending[n]) {
-                    int64_t lat = now - s_ack_pending[n];
-                    if (lat >= 0 && lat < 5000000) {
-                        g->ack_sum_us += lat;
-                        g->ack_n++;
-                        if (lat > g->ack_max_us) g->ack_max_us = (uint32_t)lat;
-                    }
-                    s_ack_pending[n] = 0;
-                }
-            }
+            acked(g, ack, now);
         }
-        uint8_t ez[ASH_MAX_FRAME];
+        // derandomized in place: the frame buffer is reset right after this frame anyway
+        uint8_t *ez = rx->buf + 1;
         size_t en = body - 1;
-        memcpy(ez, rx->buf + 1, en);
         derandomize(ez, en);
         on_ezsp(dir, ez, en, retx, now, pe);
     } else if ((c & 0xE0) == 0x80) {  // ACK
         ds->ack++;
         if (dir == DIR_NCP) {
             uint8_t ack = c & 7;
-            for (int k = 1; k < 8; k++) {
-                int n = (ack - k) & 7;
-                if (s_ack_pending[n]) {
-                    int64_t lat = now - s_ack_pending[n];
-                    if (lat >= 0 && lat < 5000000) {
-                        g->ack_sum_us += lat;
-                        g->ack_n++;
-                        if (lat > g->ack_max_us) g->ack_max_us = (uint32_t)lat;
-                    }
-                    s_ack_pending[n] = 0;
-                }
-            }
+            acked(g, ack, now);
         }
     } else if ((c & 0xE0) == 0xA0) {  // NAK
         ds->nak++;
@@ -402,8 +402,10 @@ static void on_frame(ash_dir_t dir, ash_rx_t *rx, int64_t now, pending_event_t *
 // task only, so the lock can be let go mid-feed when the batch fills up.
 static void flush_events(pending_event_t *pe, int *npe) {
     stats_unlock();
-    for (int i = 0; i < *npe; i++) stats_event(pe[i].level, "%s", pe[i].text);
-    memset(pe, 0, sizeof(pending_event_t) * PENDING_EVENTS);
+    for (int i = 0; i < *npe; i++) {
+        stats_event_r(0, pe[i].level, "%s", pe[i].text);  // the decoder follows radio 1
+        pe[i].set = false;  // ev() only looks at set
+    }
     *npe = 0;
     stats_lock();
 }
@@ -411,7 +413,7 @@ static void flush_events(pending_event_t *pe, int *npe) {
 void ezsp_decode_feed(ash_dir_t dir, const uint8_t *data, size_t len, int64_t now_us) {
     pending_event_t pe[PENDING_EVENTS];
     int npe = 0;
-    memset(pe, 0, sizeof(pe));
+    for (int i = 0; i < PENDING_EVENTS; i++) pe[i].set = false;  // ev() only looks at set
     ash_rx_t *rx = &s_rx[dir];
 
     stats_lock();

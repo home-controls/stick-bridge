@@ -72,17 +72,24 @@ settings, not the password or the token. mDNS: `zigbee-eth-bridge.local`, servic
 | GET | `/api/logs` | stored log: `flash` (where, size, used, oldest stamp in Unix ms, boot number) and `sd` (state, card, space, newest day files) |
 | GET | `/api/logs/text?src=flash[&tail=<bytes>]` / `?src=sd&name=<file>` | stored log as text/plain, oldest first; `&download=1` saves it as a file |
 | POST | `/api/logs/clear` | session only; hides the stored flash log (card files stay) |
-| GET / POST | `/api/config` | settings; POST answers with `reboot_required`. `tx_chunk` (0 = unpaced, 8-64), `tx_gap_us` (0-5000), `xoff_honor`, `xoff_max_ms` (1-200) apply at once |
+| GET / POST | `/api/config` | settings; POST answers with `reboot_required`. `tx_chunk` (0 = unpaced, 8-64), `tx_gap_us` (0-5000), `xoff_honor`, `xoff_max_ms` (1-200) apply at once. 1.0.23: `role` also `zwave`; 1.0.25: radios 2-3 also `zha` (refused on radio 1); `usb_fs_only`; `radios` `[{index, enabled, name, tcp_port, allow, baud, role}]` (radio 0's are the flat fields; either may be posted) |
 | POST | `/api/reboot`, `/api/stats/reset`, `/api/ota` (raw .bin body) | |
 | POST | `/api/password`, `/api/token`, `/api/token/revoke`, `/api/factory-reset {confirm:"RESET"}` | session only |
 | GET | `/api/update` | updates from git: state, current, latest, notes, size, done, md5, sha256, error |
 | POST | `/api/update/check`, `/api/update/install` | install answers 409 with the reason when there's nothing to install |
-| GET | `/api/dongle` | the dongle's firmware: what it runs, the stored image (name, size, MD5, SHA-256, metadata, `problem`), flash progress/result |
+| GET | `/api/dongle[?radio=n]` | the dongle's firmware: what it runs, the stored image (name, size, MD5, SHA-256, metadata, `problem`), flash progress/result. `?radio=n` (1.0.23) picks the radio these pages work on (it stays picked; 409 while another radio's stick is being flashed); the flash/check/download POSTs take it too |
+| GET | `/api/usb` | 1.0.23: USB devices on J3 (address, hub port, hub, speed, USB ID, product, radio), `fs_only`, `fs_forced`, `reforces`, `refused` |
+| POST | `/api/radio/forget` `{radio}` | 1.0.23, session only: free a radio's saved stick (409 while a stick is plugged into it) |
 | POST | `/api/dongle/image?name=<file>` (raw .gbl body), `/api/dongle/image/delete` | session only; the upload answers with the new state or 400 + why |
 | POST | `/api/dongle/flash` `{md5}` | session only; `md5` must be the stored image's; 409 + why when it can't start |
 | GET | `/api/dongles` | the dongles the bridge recognises (USB ID, chip, radio, protocol, bootloader entry, flashable) |
 | POST | `/api/dongle/firmware/check`, `/api/dongle/firmware/download` `{name}` | session only; GitHub firmware check / download into the image area; state in `GET /api/dongle` → `catalog` |
-| GET | `/metrics` | Prometheus |
+| GET | `/metrics` | Prometheus (Basic auth is checked with PBKDF2 once, then the header is remembered for 10 min until the password changes); 1.0.23 adds `zbbridge_radio_*{radio="1".."3"}` (stick/client connected, bytes each way, client drops) |
+
+`/api/status` keeps every field it had (radio 0 = the dongle) and adds `radios`: one entry per radio with its link
+(`enabled`, `name`, `role`, `tcp_port`, `allowed`, `baud`), `stick` (present, open, USB ID, serial, model, protocol,
+`fw_running`, `hub_port`), `saved_stick`, `client` and `counters` (bytes and bytes/s each way, sessions, drops). The mDNS
+TXT record keeps `zigbee_port` and adds `ports` (every enabled radio's port, radio 1 first).
 
 ## Build and flash
 
@@ -146,7 +153,7 @@ the gh CLI. To serve updates from your own git server instead, give
 manifest. Rollback: an older image has to be uploaded on System (the bridge only offers versions newer
 than its own).
 
-## Dongles (1.0.19)
+## Sticks the bridge knows (1.0.19)
 
 Any USB serial adapter on J3 is driven (`usbser.c`): **CP210x**, **CH340/CH341** and **FTDI** with the same vendor requests Linux sends
 (FTDI's 2 status bytes per packet stripped, latency timer 1 ms), and anything **CDC-ACM class** (CH9102F, ESP32-S3 bridges such as
@@ -159,7 +166,7 @@ and Nordic dongles run as bridges only for now. The CDC driver registers before 
 boot); a scan of attached devices backs that up. A new bridge firmware on trial is only kept if a dongle it identified also opens.
 
 **Firmware check** (`fwcat.c`): reads the newest releases of a GitHub repo (default Nerivec/silabs-firmware-builder, pre-releases
-included; Settings → Dongle firmware source) through the API as a stream, keeps the `zigbee_ncp` builds for the dongle's board,
+included; Settings → Silicon Labs firmware source) through the API as a stream, keeps the `zigbee_ncp` builds for the dongle's board,
 ranks them (bridge baud, flow control the board has; `hw_flow` refused without RTS/CTS) and downloads the chosen one into the image
 area with GitHub's SHA-256 checked. Flashing a build at another baud or flow switches the bridge to it once the new firmware answers
 (saved, no reboot).
@@ -175,7 +182,7 @@ area with GitHub's SHA-256 checked. Flashing a build at another baud or flow swi
 - **nRF52840 dongle** (`nrfdfu_core.c`, open USB DFU bootloader): a `.hex` becomes the `.bin` nrfutil would make and the
   bridge builds the unsigned init packet itself; enter the bootloader with the dongle's RESET button (ZBOSS builds have no
   software trigger).
-- **Thread role** (Settings → Dongle role): `openthread_rcp` builds offered/accepted, verified over Spinel after flashing
+- **Thread role** (Settings → Radios, radio 1 role): `openthread_rcp` builds offered/accepted, verified over Spinel after flashing
   (`nf_spinel_probe`), a running RCP asked into its bootloader with Spinel CMD_RESET; the client snippet becomes the OTBR
   add-on's `network_device: <bridge>:6638`.
 - **Downloadable dongle list**: `dongles.json` next to the release manifest (fetched 30 s after boot, then daily) is checked
@@ -189,7 +196,64 @@ area with GitHub's SHA-256 checked. Flashing a build at another baud or flow swi
 **PSRAM** (1.0.19): the P4NRW32X's 32 MB PSRAM is on (hex, 200 MHz). Allocations over 4 KB and TLS go there; `heap_*` in the API
 and the watchdog's low-memory check are internal RAM, `psram_*` is reported separately.
 
-## Flashing the dongle
+## Radios: several sticks behind a hub (2.0)
+
+Up to four radios, each with its own USB stick, TCP port, allowed host, role and baud, so Zigbee2MQTT, ZHA, an OpenThread
+Border Router and Z-Wave JS can all run through one bridge. Radio 1 is the coordinator the bridge always had (TCP 6638,
+the EZSP decoder, the device table and the deep charts); the others pass bytes straight through, with protocol
+detection (Z-Wave Serial API included) and firmware version sniffing (Spinel, EZSP, Z-Stack). One client per radio,
+refused/replaced the same way as radio 1's.
+
+- **Radios set themselves up** (`radio_core.c`, `dongle.c`). A stick plugged in takes the lowest free radio and its port
+  opens at once: role guessed from what the stick list says it is (Spinel: Thread; Z-Wave: Z-Wave; Zigbee: ZHA on radios
+  2-4, Zigbee2MQTT on radio 1), the stick's own baud (Thread RCPs 460800), radio 1's allowed host (the same Home
+  Assistant, not "anyone") and `6638 + i`, or the lowest free port. There is no on/off switch.
+- **Set up, missing, freed.** A radio is *set up* once a client has connected to it (NVS `r%d_su`). Unplugging the stick of
+  a radio that isn't set up frees the radio (binding gone; it disappears, nothing harmed). A set-up radio keeps its stick
+  and shows "Stick missing" (state `missing`, health -15) until the stick is back or it is forgotten. A binding that is
+  neither set up nor present 20 s after boot is freed too (no unplug ever comes for it). A stick being flashed may leave
+  the bus (bootloader) without freeing anything.
+- **Live settings.** Port, baud, allowed host, role and name apply at once: a radio's receive task rebinds its listener
+  when its port changes (or closes it when the radio goes); a new baud switches the open stick (`dx_set_link_baud`) and
+  the client reconnects; the mDNS `ports` TXT follows (`net_set_ports`). Only the network and `usb_fs_only` need a reboot.
+  Each radio carries a `gen`, bumped when a stick takes or leaves it: a dashboard edit made before that is refused (409).
+- **Hub speed.** The P4's high-speed USB port has no transaction translator, so ESP-IDF refuses full-speed devices behind a
+  hub that runs at high speed (`hub.c`), and every radio stick is full speed. With `usb_fs_only` (default on) the bridge
+  sets the controller's HCFG.FSLSSupp bit before the port gets power (`root_port_unpowered`, then
+  `usb_host_lib_set_root_port_power`): the port never answers a hub's high-speed chirp, so a USB 2.0/3.0 hub comes up at
+  full speed (12 Mbit/s shared, far above what the sticks need). A core reset after an unplug may clear the bit: a hub
+  seen at high speed while it should be full speed makes the bridge set it again and power-cycle the port, at most once
+  a minute (`radio_hub_reforce`). Tried on the board 2026-11-26: a USB 3.0 hub (its USB 2.0 part, 05e3:0610) came up at
+  full speed with an MG24 and a ZBDongle-P behind it.
+- **ZHA role.** Radios 2-4 can be a Zigbee coordinator for Home Assistant's ZHA (`zha`): flashed and detected like
+  `zigbee`; the dashboard's snippet gives ZHA's radio type from the detected protocol (EZSP, ZNP, deCONZ, ZiGate; none
+  for ZBOSS) and `socket://<bridge>:<port>`. Radio 1 refuses it: its dashboard view is Zigbee2MQTT's.
+- **Which radio a stick belongs to.** Straight on J3 it is radio 1's, whatever it is. Behind a hub a radio keeps the stick
+  it has, by VID:PID + serial, or by hub port when the serial is empty or shared; a new stick takes the lowest free radio.
+  An unknown stick never takes a radio bound to another one (at boot the Thread stick must not grab Zigbee's radio
+  because the Zigbee stick enumerated later). Sticks are opened by USB address, since identical sticks share a VID:PID.
+- **Per radio on the dashboard.** `/api/status` lists the shown radios with `state` (`no_stick`, `missing`, `opening`,
+  `ready`, `flashing`), `set_up`, `error`, `gen`; `/api/history` has `radios[].in/out`; events carry `radio` (-1 =
+  the bridge). The device table only comes from radio 1's EZSP traffic.
+- **Tasks and memory (2.0.1).** Every radio has its receive and send task (6 KB stacks in PSRAM, `task_start(...,
+  psram)` in `tasks.c`) and a 16 KB stream in PSRAM from boot; an idle radio's tasks sleep. A task whose stack is in
+  PSRAM must never write flash (the cache goes off), so the one NVS write a radio task needed (set up on the first
+  client) is the dongle task's (`dx_request_set_up`). lwIP allocates its buffers in PSRAM first
+  (`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`; the EMAC copies into its own DMA buffers). Internal stacks are sized from
+  what `GET /api/tasks` measured on the board (each task's stack, high-water mark and where it lives, plus the
+  internal / DMA / PSRAM heaps; System, Memory and tasks). Radios 2-4 never hold writes on XOFF (0x13 is SendData in
+  Z-Wave).
+- **Limits.** 16 host channels: the hub takes 2, a CP210x/CH34x/FTDI stick 3, a CDC-ACM stick 4, so four CDC-ACM sticks
+  don't fit (the radio then shows "can't open the stick ... out of channels"). One hub level
+  (`CONFIG_USB_HOST_HUB_MULTI_LEVEL=n`). ESP-IDF 5.5's hub driver aborts (reboot) on some hub port errors, only logs
+  hub status changes and has no port debounce: soak a hub before putting the Zigbee coordinator behind it.
+- **NVS.** `r%d_*` (name, port, allow, baud, role, su), `r0_name`, `usb_fs`, saved sticks `rb0..rb3`, `rsv=2` once the
+  1.x settings were moved (radios with a saved stick became set up; `r%d_on` erased; clashing ports moved).
+- **Flashing and firmware checks** pick their radio (`?radio=n`); each radio keeps its own check result, for the stick it
+  had then (an identical check for another radio under 10 min old is reused); one image store and one flash at a time.
+  Z-Wave radios are never flashed here.
+
+## Flashing a stick
 
 System → **Dongle firmware**: upload a Zigbee coordinator (NCP) `.gbl` for the dongle, then **Flash the dongle**.
 
@@ -264,7 +328,9 @@ each boot (number, firmware, reset reason), "Clock set", lines lost if the write
 | Update over the network | `python tools/ota_install.py <host> <pw-file> [image]` |
 | Broken updates | `python tools/ota_test.py <images dir>`: an OTA test build (see the script) installs anything newer from a release server on the PC, which serves a different bad release each time: bad manifests (404, not JSON, missing/bad md5, 10 MB, hangs, redirect loop, 6 KB notes), MD5 / SHA-256 / size mismatch, truncated (both encodings), extra bytes, 404, other chip, other project, version mismatch, not an image, corrupt image with matching hashes, stall, 2 KB/s drip, a power cut mid-download, firmware that crashes at boot, firmware with no network, then a good release. Each must be refused (or rolled back) with the bridge still up on the right firmware |
 | Stored log format (host) | `python test/host/test_logstore.py`: `logstore_core.c` built in WSL with ASan/UBSan on a simulated NOR flash (erase = 0xFF, writes only clear bits, overwrites reported): blank and garbage areas, wrapping with remounts, 400 rounds of power cuts mid-write and mid-erase, clear + floor, a reader lapped by the writer; stamps against Python's UTC dates |
-| USB serial, dongle list, protocol detection (host) | `python test/host/test_usbser.py`: chip by VID:PID, CH340/FTDI baud divisors against Linux values, FTDI status stripping, catalogue matches for real USB strings, detection of ASH/ZNP/deCONZ/ZiGate/Spinel frames and not of noise |
+| USB serial, dongle list, protocol detection (host) | `python test/host/test_usbser.py`: chip by VID:PID, CH340/FTDI baud divisors against Linux values, FTDI status stripping, catalogue matches for real USB strings, detection of ASH/ZNP/deCONZ/ZiGate/Spinel/Z-Wave frames and not of noise |
+| Radios (host) | `python test/host/test_radio.py`: `radio_core.c` built in WSL with ASan/UBSan: which radio a stick lands on (J3 alone, a hub added, every boot order, replug on another port, sticks without serials, duplicate serials, disabled radios, Forget), per-radio settings checks, the full-speed re-force rate limit; then a mutation check (each rule broken in a copy must fail the scenarios) |
+| Radios dashboard (PC) | `MOCK_RADIOS=3 python tools/mock_bridge.py 18302` + `BRIDGE=http://127.0.0.1:18302 npm run dev` in `web/`: hub with three radios, a refused stick, Forget, per-radio settings |
 | Firmware catalogue (host) | `python test/host/test_fwcat.py [releases.json ...]`: file-name parser, version compare, variant scoring, and the streaming scanner on real GitHub API answers in random-sized pieces (every asset's name, size, SHA-256 and URL vs Python's json) |
 | Unzip (host) | `python test/host/test_unzip.py [release.zip]`: streaming single-file zip with zlib as the inflater on a real Koenkk release, byte-for-byte; damage/CRC/truncation/encryption refused (the device's tinfl adapter is exercised by uploading a Koenkk zip to the bridge) |
 | TI flasher (host) | `python test/host/test_tiflash.py`: simulated CC26x2 ROM bootloader incl. DTR/RTS entry logic, CCFG safety refusals, retries, CRC32 verify, Intel HEX parser, real Koenkk zip flashed into the simulator |

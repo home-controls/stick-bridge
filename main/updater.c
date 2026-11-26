@@ -1,4 +1,5 @@
 #include "updater.h"
+#include "tasks.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -101,39 +102,53 @@ static bool is_hex(const char *s, size_t n) {
 
 static const char *update_url(const bridge_settings_t *cfg) { return TEST_LOOP ? TEST_URL : cfg->update_url; }
 
-// Opens url and reads the response headers, following up to 3 redirects. Returns the client (the
+// GitHub release downloads redirect twice, the second time to a signed release-assets.githubusercontent.com
+// address of ~900 characters: the address buffer and the header buffers must hold it (a 256-byte buffer cut it
+// short, and the cut request came back as a bogus status).
+#define URL_MAX 2048
+
+// Opens url and reads the response headers, following up to 4 redirects. Returns the client (the
 // caller cleans it up) with *status set, or NULL with *why set. Each hop gets a fresh client: one
 // reused after esp_http_client_set_redirection() read the new body wrongly.
 static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *len, const char **why) {
-    char next[256];
-    strlcpy(next, url, sizeof(next));
+    char *next = malloc(URL_MAX);
+    if (!next) {
+        *why = "out of memory";
+        return NULL;
+    }
+    strlcpy(next, url, URL_MAX);
     *status = 0;
     *len = -1;
+    esp_http_client_handle_t ret = NULL;
     for (int hop = 0;; hop++) {
         esp_http_client_config_t cfg = {
             .url = next,
             .timeout_ms = 15000,
             .crt_bundle_attach = esp_crt_bundle_attach,
             .user_agent = "zigbee-eth-bridge",
-            .buffer_size = 2048,
-            .buffer_size_tx = 1024,
+            .buffer_size = 4096,     // a long Location header
+            .buffer_size_tx = 2048,  // the long request line after the redirect
             .disable_auto_redirect = true,
         };
         esp_http_client_handle_t c = esp_http_client_init(&cfg);
         if (!c) {
             *why = "out of memory";
-            return NULL;
+            break;
         }
         if (esp_http_client_open(c, 0) != ESP_OK) {
             *why = "can't connect";
         } else {
             *len = esp_http_client_fetch_headers(c);
             *status = esp_http_client_get_status_code(c);
+            const char *h = strstr(next, "://");
+            ESP_LOGI(TAG, "hop %d: %.40s -> HTTP %d, length %lld", hop + 1, h ? h + 3 : next, *status, (long long)*len);
             bool redirect = *status == 301 || *status == 302 || *status == 303 || *status == 307 || *status == 308;
             if (*status == 0 || *len < -1) *why = "no answer";  // -1 is a chunked response (no length), not an error
-            else if (!redirect) return c;
-            else if (hop >= 3) *why = "too many redirects";
-            else if (esp_http_client_set_redirection(c) != ESP_OK || esp_http_client_get_url(c, next, sizeof(next)) != ESP_OK)
+            else if (!redirect) {
+                ret = c;
+                break;
+            } else if (hop >= 4) *why = "too many redirects";
+            else if (esp_http_client_set_redirection(c) != ESP_OK || esp_http_client_get_url(c, next, URL_MAX) != ESP_OK)
                 *why = "bad redirect";
             else {
                 esp_http_client_cleanup(c);
@@ -141,8 +156,10 @@ static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *
             }
         }
         esp_http_client_cleanup(c);
-        return NULL;
+        break;
     }
+    free(next);
+    return ret;
 }
 
 // ---------------------------------------------------------------- check
@@ -394,7 +411,7 @@ static void updater_task(void *arg) {
 
 void updater_start(void) {
     s_lock = xSemaphoreCreateMutex();
-    xTaskCreate(updater_task, "updater", 12288, NULL, 4, &s_task);  // TLS handshake runs here
+    s_task = task_start(updater_task, "updater", 9216, NULL, 4, false);  // TLS handshake runs here
 }
 
 void updater_check_now(void) { xTaskNotify(s_task, NOTIFY_CHECK, eSetBits); }

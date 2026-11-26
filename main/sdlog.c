@@ -76,7 +76,8 @@ static void lost(const char *why) {
     s_next_try = now_s() + RETRY_S;
 }
 
-static void try_mount(void) {
+// format: make a fresh FAT file system if the card doesn't mount (a card that isn't FAT32).
+static void try_mount_ex(bool format) {
     if (!s_ldo) {
         sd_pwr_ctrl_ldo_config_t c = {.ldo_chan_id = LDO_CHAN};
         if (sd_pwr_ctrl_new_on_chip_ldo(&c, &s_ldo) != ESP_OK) {
@@ -105,7 +106,7 @@ static void try_mount(void) {
     slot.d2 = GPIO_NUM_41;
     slot.d3 = GPIO_NUM_42;
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-    esp_vfs_fat_sdmmc_mount_config_t mc = {.format_if_mount_failed = false, .max_files = 3, .allocation_unit_size = 16 * 1024};
+    esp_vfs_fat_sdmmc_mount_config_t mc = {.format_if_mount_failed = format, .max_files = 3, .allocation_unit_size = 16 * 1024};
 
     driver_logs(ESP_LOG_NONE);
     esp_err_t e = esp_vfs_fat_sdmmc_mount(MOUNT, &host, &slot, &mc, &s_card);
@@ -114,7 +115,7 @@ static void try_mount(void) {
         sd_state_t was = s_state;
         if (e == ESP_FAIL) {
             s_state = SD_ERROR;
-            snprintf(s_detail, sizeof(s_detail), "The card isn't FAT32: format it as FAT32 on a computer");
+            snprintf(s_detail, sizeof(s_detail), "The card isn't FAT32: format it here (Format card) or on a computer");
         } else {
             s_state = SD_NONE;
             snprintf(s_detail, sizeof(s_detail), "No card");
@@ -145,6 +146,8 @@ static void try_mount(void) {
              (unsigned long)s_card->real_freq_khz);
 }
 
+static void try_mount(void) { try_mount_ex(false); }
+
 // Day files, newest first. Returns how many names were put in out (each up to 31 chars).
 static int list_files(char (*out)[32], int max, uint64_t *total_bytes, int *count) {
     DIR *d = opendir(DIR_PATH);
@@ -159,7 +162,7 @@ static int list_files(char (*out)[32], int max, uint64_t *total_bytes, int *coun
         if (len < 5 || len > 31 || strcmp(e->d_name + len - 4, ".log") != 0) continue;
         (*count)++;
         struct stat st;
-        snprintf(path, sizeof(path), DIR_PATH "/%s", e->d_name);
+        snprintf(path, sizeof(path), DIR_PATH "/%.255s", e->d_name);
         if (stat(path, &st) == 0) *total_bytes += st.st_size;
         // keep the `max` newest (names sort by date; boot-N files after them)
         int pos = n;
@@ -192,7 +195,7 @@ static void make_room(void) {
         closedir(d);
         if (!oldest[0]) return;
         char path[300];
-        snprintf(path, sizeof(path), DIR_PATH "/%s", oldest);
+        snprintf(path, sizeof(path), DIR_PATH "/%.255s", oldest);
         ESP_LOGW(TAG, "Card nearly full (%llu MB free): deleting %s", (unsigned long long)(free_b >> 20), oldest);
         if (unlink(path) != 0) return;
     }
@@ -245,6 +248,37 @@ void sdlog_append(const char *text, size_t n, int64_t epoch_ms, uint32_t boot_no
     xSemaphoreGive(s_lock);
 }
 
+esp_err_t sdlog_format(char *err, size_t err_len) {
+    ensure_lock();
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20000)) != pdTRUE) {
+        snprintf(err, err_len, "The card is busy: try again");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t e;
+    if (s_state == SD_OK && s_card) {
+        ESP_LOGW(TAG, "Formatting the card (asked from the dashboard)");
+        e = esp_vfs_fat_sdcard_format(MOUNT, s_card);
+        if (e == ESP_OK) {
+            mkdir(DIR_PATH, 0777);
+            s_written = 0;
+            s_next_space = 0;
+        } else {
+            snprintf(err, err_len, "Formatting failed: %s", esp_err_to_name(e));
+            lost("Formatting failed");
+        }
+    } else {
+        // Not mounted: either no card, or one that isn't FAT. Mount with format-on-failure.
+        unmount();
+        s_cycle_power = true;
+        ESP_LOGW(TAG, "Formatting the card if it doesn't mount (asked from the dashboard)");
+        try_mount_ex(true);
+        e = s_state == SD_OK ? ESP_OK : ESP_FAIL;
+        if (e != ESP_OK) snprintf(err, err_len, "%s", s_state == SD_NONE ? "No card in the slot" : s_detail);
+    }
+    xSemaphoreGive(s_lock);
+    return e;
+}
+
 void sdlog_add_json(cJSON *root) {
     ensure_lock();
     cJSON *sd = cJSON_AddObjectToObject(root, "sd");
@@ -273,7 +307,7 @@ void sdlog_add_json(cJSON *root) {
         char path[300];
         for (int i = 0; i < n; i++) {
             struct stat st;
-            snprintf(path, sizeof(path), DIR_PATH "/%s", names[i]);
+            snprintf(path, sizeof(path), DIR_PATH "/%.255s", names[i]);
             cJSON *f = cJSON_CreateObject();
             cJSON_AddStringToObject(f, "name", names[i]);
             cJSON_AddNumberToObject(f, "size", stat(path, &st) == 0 ? (double)st.st_size : 0);
@@ -309,7 +343,7 @@ esp_err_t sdlog_send_file(httpd_req_t *req, const char *name, bool download) {
     }
     esp_err_t e;
     char path[300];
-    snprintf(path, sizeof(path), DIR_PATH "/%s", name);
+    snprintf(path, sizeof(path), DIR_PATH "/%.255s", name);
     FILE *f = s_state == SD_OK ? fopen(path, "r") : NULL;
     if (!f) {
         xSemaphoreGive(s_lock);

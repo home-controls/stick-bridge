@@ -1,0 +1,105 @@
+# Host tests, the dashboard page, the firmware and the release files, on every push and pull request;
+# the release workflow runs this first and publishes the files it built. Read-only: no secrets.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions: {}
+
+# a newer push to the same branch replaces a running check; a release's own run is never cancelled
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/') || github.event_name == 'pull_request' }}
+
+jobs:
+  host-tests:
+    name: Host tests (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compiler and zlib
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends build-essential zlib1g-dev
+      - name: Tests
+        run: python3 test/host/run_all.py
+
+  web:
+    name: Dashboard page
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install (lockfile only, no install scripts)
+        run: npm ci --ignore-scripts
+      - name: Build (kit check, type check, bundle, inline into the firmware's page)
+        run: npm run build
+      - name: The committed page is this build
+        run: |
+          if [ -n "$(git status --porcelain -- ../main/web)" ]; then
+            git status --short -- ../main/web
+            echo "::error::main/web/index.html doesn't match web/: run npm run build in web/ and commit the result"
+            exit 1
+          fi
+
+  checks:
+    name: Version, changelog, workflows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The version has a changelog entry, short enough for the bridge to show
+        run: python3 tools/release_info.py
+      - name: Workflow security audit (zizmor)
+        run: pipx run zizmor==1.33.1 --persona regular --min-severity medium .github/workflows
+
+  firmware:
+    name: Firmware
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    container:
+      image: espressif/idf:v5.5.6@sha256:bf72fe7a15c22849a9a94147301165a545fb8905d97c176cf748e3e4614cac84
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          idf.py build
+      - name: Release files (image, MD5, manifest, first-flash image, dongles.json, SHA256SUMS)
+        run: |
+          . "$IDF_PATH/export.sh" > /dev/null
+          python tools/release_info.py --notes "$RUNNER_TEMP/notes.md"
+          python tools/publish_release.py --notes-file "$RUNNER_TEMP/notes.md" --assets-only
+          version=$(cat version.txt)
+          mkdir -p dist && cp "release/$version"/* dist/
+          (cd dist && sha256sum -c SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

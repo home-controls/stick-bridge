@@ -1,4 +1,5 @@
 #include "watchdog.h"
+#include "tasks.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,11 +113,12 @@ static void watchdog_task(void *arg) {
 
         if (tick % NET_CHECK_S) continue;
         stats_lock();
-        bool client = g_stats.client_connected, ip = g_stats.eth_has_ip, link = g_stats.eth_link;
+        bool client = false, ip = g_stats.eth_has_ip, link = g_stats.eth_link;
+        for (int r = 0; r < RADIO_MAX; r++) client = client || g_radio[r].client_connected;  // any radio's client
         uint32_t gw = g_stats.gw;
         stats_unlock();
         if (!s_test_target && (client || !link || !ip)) {
-            // Zigbee2MQTT connected: the network works. No link: a cable, not something a restart fixes.
+            // A client connected (Zigbee2MQTT or another radio's): the network works. No link: a cable, not something a restart fixes.
             net_fail = 0;
             continue;
         }
@@ -152,7 +154,7 @@ void watchdog_start(void) {
         stats_event(EV_WARN, "Restarted by the watchdog: %s", s_last_reason);
     }
     s_rtc_magic = 0;
-    xTaskCreate(watchdog_task, "watchdog", 4096, NULL, 2, NULL);
+    task_start(watchdog_task, "watchdog", 3072, NULL, 2, false);
 }
 
 #ifdef CONFIG_BRIDGE_TEST_HOOKS

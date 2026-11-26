@@ -123,16 +123,29 @@ void net_start(const bridge_settings_t *cfg) {
         mdns_instance_name_set("Zigbee Ethernet Bridge");
         mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
         // Discovery for Zigbee Studio and other tools: API on port 80, Zigbee serial on tcp_port.
-        char zport[8];
+        // ports: every shown radio's TCP port, radio 1 first ("6638,6639"); net_set_ports keeps it current.
+        char zport[8], ports[32] = "";
         snprintf(zport, sizeof(zport), "%u", cfg->tcp_port);
+        radio_ports_txt(cfg->radios, settings_radio_shown_mask(), ports, sizeof(ports));
         mdns_txt_item_t txt[] = {
             {"api", "zbbridge/1"},
             {"zigbee_port", zport},
+            {"ports", ports},
             {"version", esp_app_get_description()->version},
         };
-        mdns_service_add("Zigbee Ethernet Bridge", "_zbbridge", "_tcp", 80, txt, 3);
+        mdns_service_add("Zigbee Ethernet Bridge", "_zbbridge", "_tcp", 80, txt, 4);
     }
 
     esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(2, ESP_SNTP_SERVER_LIST("pool.ntp.org", "time.google.com"));
     esp_netif_sntp_init(&sntp);
+}
+
+void net_set_ports(void) {
+    bridge_settings_t cfg;
+    settings_get(&cfg);
+    char zport[8], ports[32];
+    snprintf(zport, sizeof(zport), "%u", cfg.tcp_port);
+    radio_ports_txt(cfg.radios, settings_radio_shown_mask(), ports, sizeof(ports));
+    mdns_service_txt_item_set("_zbbridge", "_tcp", "zigbee_port", zport);
+    mdns_service_txt_item_set("_zbbridge", "_tcp", "ports", ports);
 }

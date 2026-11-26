@@ -16,6 +16,7 @@ typedef enum {
     PROTO_ZIGATE,  // ZiGate (0x01 .. 0x03)                 -> "zigate"
     PROTO_ZBOSS,   // Nordic/Espressif ZBOSS NCP            -> "zboss"
     PROTO_SPINEL,  // OpenThread RCP (not for Zigbee2MQTT)
+    PROTO_ZWAVE,   // Z-Wave Serial API (SOF 01 len type cmd .. checksum) -> Z-Wave JS
 } proto_t;
 
 // How the dongle gets into its bootloader for flashing (beyond what its firmware can do itself, like
@@ -39,6 +40,7 @@ typedef enum {
     FAM_NORDIC,  // nRF52840, DFU zip
     FAM_ESP,     // ESP32-C6/H2
     FAM_NXP,     // ZiGate (JN5189)
+    FAM_ZWAVE,   // Z-Wave controller sticks (ZGM130S / EFR32ZG): passed through, not flashed here
 } family_t;
 
 typedef struct {

@@ -320,12 +320,12 @@ const char *nd_init_policy(const nd_init_t *in) {
     if (!in->has_hw_version) return "init packet has no hw_version (the bootloader requires one)";
     if (in->hw_version != ND_HW_VERSION) {
         static char why[120];
-        snprintf(why, sizeof(why), "init packet is for hw_version %u; the dongle's bootloader takes 52 (nrfutil --hw-version 52)",
+        snprintf(why, sizeof(why), "init packet is for hw_version %u; the stick's bootloader takes 52 (nrfutil --hw-version 52)",
                  (unsigned)in->hw_version);
         return why;
     }
     if (!in->has_app_size || in->app_size == 0) return "init packet has no application size";
-    if (in->app_size > ND_APP_LIMIT - ND_APP_START) return "application is bigger than the dongle's flash";
+    if (in->app_size > ND_APP_LIMIT - ND_APP_START) return "application is bigger than the stick's flash";
     return NULL;
 }
 
@@ -410,7 +410,7 @@ const char *nd_image_check(const nd_io_t *io, uint32_t bin_len, const nd_init_t 
     // An app that needs a SoftDevice sits after it, at an address only the SoftDevice knows.
     bool needs_sd = in->sd_req_count > 0 && in->sd_req[0] != 0;
     if (!(reset & 1) || (!needs_sd && ((reset & ~1u) < ND_APP_START + 8 || (reset & ~1u) >= ND_APP_START + bin_len))) {
-        snprintf(why, sizeof(why), "firmware isn't linked for the dongle's bootloader (reset handler 0x%08x, expected inside 0x%x..0x%x)",
+        snprintf(why, sizeof(why), "firmware isn't linked for the stick's bootloader (reset handler 0x%08x, expected inside 0x%x..0x%x)",
                  (unsigned)reset, ND_APP_START, (unsigned)(ND_APP_START + bin_len));
         return why;
     }
@@ -617,13 +617,13 @@ const char *nd_ext_error_str(uint8_t c) {
         "init command invalid",
         "firmware version too low",
         "hardware version doesn't match this bootloader",
-        "needs a SoftDevice this dongle hasn't got (sd_req)",
+        "needs a SoftDevice this stick hasn't got (sd_req)",
         "this bootloader wants signed updates (not the open bootloader)",
         "hash type not supported",
         "hash couldn't be calculated",
         "signature type not supported",
         "firmware doesn't match the hash in the init packet",
-        "not enough space on the dongle",
+        "not enough space on the stick",
     };
     return c < sizeof(t) / sizeof(t[0]) ? t[c] : "unknown extended error";
 }
@@ -638,7 +638,7 @@ static bool send(st_t *s, const uint8_t *p, size_t n) {
         else s->tx[o++] = p[i];
     }
     s->tx[o++] = SLIP_END;
-    if (s->io->write(s->io->ctx, s->tx, o) != 0) return fail(s, "the dongle went away (USB write failed)");
+    if (s->io->write(s->io->ctx, s->tx, o) != 0) return fail(s, "the stick went away (USB write failed)");
     return true;
 }
 
@@ -691,7 +691,7 @@ static int request(st_t *s, const uint8_t *req, size_t n, uint8_t *out, size_t m
     for (;;) {
         uint32_t el = s->io->now_ms(s->io->ctx) - t0;
         int g = el >= timeout_ms ? 0 : recv(s, timeout_ms - el);
-        if (g < 0) return fail(s, "the dongle went away (during %s)", op_name(op)), -1;
+        if (g < 0) return fail(s, "the stick went away (during %s)", op_name(op)), -1;
         if (g == 0) return fail(s, "the bootloader didn't answer %s", op_name(op)), -1;
         if (s->flen < 3 || s->frame[0] != OP_RESPONSE || s->frame[1] != op) {
             logf_(s, "ignored a stray %u-byte frame (%02x %02x)", (unsigned)s->flen, s->frame[0], s->flen > 1 ? s->frame[1] : 0);
@@ -803,7 +803,7 @@ bool nd_flash(const nd_io_t *io, const nd_flash_opts_t *o, nd_result_t *r, char 
     if (in.is_signed) logf_(s, "init packet is signed (the open bootloader doesn't check application signatures)");
 
     // ---- the bootloader
-    if (io->set_lines && io->set_lines(io->ctx, true, true) != 0) return fail(s, "the dongle went away (setting DTR)");
+    if (io->set_lines && io->set_lines(io->ctx, true, true) != 0) return fail(s, "the stick went away (setting DTR)");
     drain(s);
     if (ping(s, 3, 300)) {
         r->entered = "already in the bootloader";
@@ -811,14 +811,14 @@ bool nd_flash(const nd_io_t *io, const nd_flash_opts_t *o, nd_result_t *r, char 
         if (s->err[0]) return false;
         int rc = io->enter_dfu ? io->enter_dfu(io->ctx) : -1;
         if (rc != 0)
-            return fail(s, "the dongle isn't in its DFU bootloader: press its RESET button (the sideways one, "
+            return fail(s, "the stick isn't in its DFU bootloader: press its RESET button (the sideways one, "
                            "pushed towards the USB plug; the red LED fades) and try again");
         logf_(s, "DFU trigger sent, looking for the bootloader");
-        if (io->set_lines && io->set_lines(io->ctx, true, true) != 0) return fail(s, "the dongle went away (setting DTR)");
+        if (io->set_lines && io->set_lines(io->ctx, true, true) != 0) return fail(s, "the stick went away (setting DTR)");
         drain(s);
         if (!ping(s, 20, 250)) {
             if (s->err[0]) return false;
-            return fail(s, "the dongle didn't come up in its DFU bootloader after the trigger: press its RESET button and try again");
+            return fail(s, "the stick didn't come up in its DFU bootloader after the trigger: press its RESET button and try again");
         }
         r->entered = "DFU trigger";
     }
@@ -854,7 +854,7 @@ bool nd_flash(const nd_io_t *io, const nd_flash_opts_t *o, nd_result_t *r, char 
         if (r->ext_error) {
             char e2[160];
             snprintf(e2, sizeof(e2), "%s", err);
-            return fail(s, "the dongle's bootloader refused the init packet: %s (nothing was erased)", e2);
+            return fail(s, "the stick's bootloader refused the init packet: %s (nothing was erased)", e2);
         }
         return false;
     }
@@ -883,11 +883,11 @@ bool nd_flash(const nd_io_t *io, const nd_flash_opts_t *o, nd_result_t *r, char 
         if (got < 0) {
             char e2[160];
             snprintf(e2, sizeof(e2), "%s", err);
-            return fail(s, "%s at %u%%; the dongle waits in its bootloader for another try", e2,
+            return fail(s, "%s at %u%%; the stick waits in its bootloader for another try", e2,
                         (unsigned)((uint64_t)off * 100 / o->bin_len));
         }
         if (got == 0)
-            return fail(s, "firmware kept arriving damaged at %u%%; the dongle waits in its bootloader for another try",
+            return fail(s, "firmware kept arriving damaged at %u%%; the stick waits in its bootloader for another try",
                         (unsigned)((uint64_t)off * 100 / o->bin_len));
         crc = next;
         off += k;

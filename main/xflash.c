@@ -68,14 +68,14 @@ static xf_progress_fn s_progress;
 
 static int io_read(void *ctx, uint8_t *buf, size_t max, uint32_t timeout_ms) {
     (void)ctx;
-    if (!dongle_ready()) return -1;
+    if (!dongle_fl_ready()) return -1;
     size_t n = xStreamBufferReceive(dongle_claim_rx(), buf, max, pdMS_TO_TICKS(timeout_ms));
-    if (n == 0 && !dongle_ready()) return -1;
+    if (n == 0 && !dongle_fl_ready()) return -1;
     return (int)n;
 }
 static int io_write(void *ctx, const uint8_t *buf, size_t len) {
     (void)ctx;
-    if (!dongle_ready()) return -1;
+    if (!dongle_fl_ready()) return -1;
     return dongle_claimed_write(buf, len, 2000) == ESP_OK ? 0 : -1;
 }
 static int io_baud(void *ctx, uint32_t baud) {
@@ -136,7 +136,7 @@ static const gf_io_t s_gf_store = {.read = io_read, .write = io_write, .set_baud
 
 static const char *check_gcf(uint32_t size, const char *name, char *desc, size_t dl) {
     dongle_info_t d;
-    dongle_info(&d);
+    dongle_fl_info(&d);
     gf_device_t want = conbee_kind(&d);
     gf_file_t f;
     const char *why;
@@ -158,10 +158,10 @@ static const char *check_gcf(uint32_t size, const char *name, char *desc, size_t
 
 static bool flash_gcf(uint32_t size, const char *name, xf_result_t *r, char *err, size_t el) {
     dongle_info_t d;
-    dongle_info(&d);
+    dongle_fl_info(&d);
     gf_device_t dev = conbee_kind(&d);
     if (dev == GF_DEV_UNKNOWN) {
-        snprintf(err, el, "The dongle isn't a ConBee II or III");
+        snprintf(err, el, "The stick isn't a ConBee II or III");
         return false;
     }
     gf_flash_opts_t o = {.device = dev, .file_name = name, .size = size, .budget_ms = 0};
@@ -192,7 +192,7 @@ static const char *nrf_prepare(uint32_t size, uint8_t **bin, uint32_t *bin_len, 
     uint32_t start = 0, dropped = 0;
     const char *why = nd_hex_to_bin(&s_nd_store, size, *bin, NRF_BIN_MAX, bin_len, &start, &dropped);
     if (why) return why;
-    if (start != ND_APP_START) return "This .hex isn't an nRF52840 dongle application (it doesn't start at 0x1000)";
+    if (start != ND_APP_START) return "This .hex isn't an nRF52840 Dongle application (it doesn't start at 0x1000)";
     s_buf = *bin;
     s_buf_len = *bin_len;
     uint8_t sha[32];
@@ -210,7 +210,7 @@ static const char *check_nrf(uint32_t size, char *desc, size_t dl) {
     uint32_t bin_len = 0;
     size_t init_len = 0;
     const char *why = nrf_prepare(size, &bin, &bin_len, init, &init_len);
-    if (!why) snprintf(desc, dl, "nRF52840 dongle application, %lu KB", (unsigned long)(bin_len + 1023) / 1024);
+    if (!why) snprintf(desc, dl, "nRF52840 stick application, %lu KB", (unsigned long)(bin_len + 1023) / 1024);
     free(bin);
     s_buf = NULL;
     return why;
@@ -235,7 +235,7 @@ static bool flash_nrf(uint32_t size, xf_result_t *r, char *err, size_t el) {
     r->entered = nr.entered;
     r->in_bootloader = !ok && nr.app_erased;
     if (!ok && !nr.app_erased && strstr(err, "bootloader") == NULL)
-        snprintf(err + strlen(err), el - strlen(err), " (press the dongle's RESET button sideways to start its bootloader, then flash again)");
+        snprintf(err + strlen(err), el - strlen(err), " (press the stick's RESET button sideways to start its bootloader, then flash again)");
     if (ok) {
         // the bootloader starts the new app: it comes back on USB as itself
         dongle_wait_reopen(15000);
@@ -322,7 +322,7 @@ static const tf_io_t s_tf_buf = {.read = io_read, .write = io_write, .set_baud =
 
 static uint32_t ti_chip_flash(void) {
     dongle_info_t d;
-    dongle_info(&d);
+    dongle_fl_info(&d);
     if (d.model->family != FAM_TI || !d.model->radio) return 0;  // unknown: the image decides
     return (strstr(d.model->radio, "P7") || strstr(d.model->radio, "R7")) ? 0xB0000 : 0x58000;
 }
@@ -357,7 +357,7 @@ static bool xf_ti_flash(xf_read_fn rd, uint32_t size, const char *name, xf_resul
     s_buf = img;
     s_buf_len = len;
     dongle_info_t d;
-    dongle_info(&d);
+    dongle_fl_info(&d);
     tf_entry_t entry = d.model->reset == RST_TI_SONOFF   ? TF_ENTRY_SONOFF
                        : d.model->reset == RST_TI_CC2538 ? TF_ENTRY_DEFAULT
                        : d.model->family == FAM_TI       ? TF_ENTRY_NONE
@@ -381,7 +381,7 @@ static bool xf_ti_flash(xf_read_fn rd, uint32_t size, const char *name, xf_resul
         snprintf(r->after, sizeof(r->after), "Z-Stack %.8s (CRC-32 verified on the chip)", date ? date : "image");
     } else if (entry == TF_ENTRY_NONE && !tr.erased) {
         size_t n = strlen(err);
-        snprintf(err + n, el - n, " (hold the dongle's BOOT button while plugging it in, then flash again)");
+        snprintf(err + n, el - n, " (hold the stick's BOOT button while plugging it in, then flash again)");
     }
     return ok;
 }
