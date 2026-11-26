@@ -296,6 +296,7 @@ typedef struct {
 // The stored .gbl's flags and metadata, parsed once when it's stored (not on every /api/dongle poll).
 static meta_t s_meta;
 static bool s_signed, s_encrypted;
+static nf_gbl_t s_app;  // the stored .gbl's application info (has_app_info, app_type), for the role check
 
 static void parse_meta(const nf_gbl_t *g, meta_t *m) {
     memset(m, 0, sizeof(*m));
@@ -324,6 +325,11 @@ static void fl_cfg(bridge_settings_t *c) {
         c->baud = c->radios[r].baud;
         c->hw_flow = false;
     }
+}
+
+// What the picked radio's new firmware must be: an OpenThread RCP for a Thread radio, else a Zigbee coordinator.
+static uint8_t expect_now(void) {
+    return settings_radio_role(dongle_fl_index()) == BRIDGE_ROLE_THREAD ? NF_EXPECT_SPINEL : NF_EXPECT_EZSP;
 }
 
 static const char *meta_problem(const meta_t *m, uint32_t baud, char *buf, size_t n) {
@@ -390,6 +396,7 @@ static void load_image(void) {
     s_meta = m;
     s_signed = g.is_signed;
     s_encrypted = g.encrypted;
+    s_app = g;
     s_kind = k;
     strlcpy(s_desc, desc, sizeof(s_desc));
     s_have = true;
@@ -466,8 +473,11 @@ const char *ncpflash_upload_end(bool complete) {
     memset(&g, 0, sizeof(g));
     char desc[96] = "";
     if (!fail) {
-        if (s_up.kind == IMG_GBL) fail = nf_gbl_check(&s_io, s_up.size, &g);
-        else fail = xf_check(s_up.kind, store_read, s_up.size, s_up.name, desc, sizeof(desc));
+        if (s_up.kind == IMG_GBL) {
+            if ((fail = nf_gbl_check(&s_io, s_up.size, &g)) == NULL) fail = nf_gbl_app_problem(&g, expect_now());
+        } else {
+            fail = xf_check(s_up.kind, store_read, s_up.size, s_up.name, desc, sizeof(desc));
+        }
     }
     if (!fail) {
         img_hdr_t h = {.magic = magic_for(s_up.kind), .size = s_up.size, .tag_len = s_up.kind == IMG_GBL ? g.tag_len : s_up.size,
@@ -488,6 +498,7 @@ const char *ncpflash_upload_end(bool complete) {
             s_meta = m;
             s_signed = g.is_signed;
             s_encrypted = g.encrypted;
+            s_app = g;
             s_kind = s_up.kind;
             strlcpy(s_desc, desc, sizeof(s_desc));
             s_have = true;
@@ -613,7 +624,7 @@ static void flash_task(void *arg) {
             vTaskDelete(NULL);
             return;
         }
-    } else if (why == NULL && (why = nf_gbl_check(&s_io, h.size, &g)) == NULL) {
+    } else if (why == NULL && (why = nf_gbl_check(&s_io, h.size, &g)) == NULL && (why = nf_gbl_app_problem(&g, expect_now())) == NULL) {
         parse_meta(&g, &m);
         why = meta_problem(&m, cfg.baud, pbuf, sizeof(pbuf));
     }
@@ -722,8 +733,14 @@ bool ncpflash_flash(const char *md5, char *why, size_t why_len) {
         strlcpy(why, "That isn't the stored image (MD5 differs): reload the page", why_len);
         return false;
     }
+    // Busy from here: the picked radio (dongle_fl_select refuses another meanwhile) is the one checked and flashed.
+    if (!busy_take()) {
+        strlcpy(why, "The stick is already being flashed", why_len);
+        return false;
+    }
     if (!dongle_fl_ready()) {
         strlcpy(why, "No stick connected", why_len);
+        busy_give();
         return false;
     }
     dongle_info_t d;
@@ -733,18 +750,17 @@ bool ncpflash_flash(const char *md5, char *why, size_t why_len) {
     if (d.model->family != want && d.model->family != FAM_UNKNOWN) {
         snprintf(why, why_len, "%s has a %s radio (%s): this is %s firmware", d.model->name, family_name(d.model->family),
                  d.model->radio, xf_kind_name(k));
+        busy_give();
         return false;
     }
     if (settings_radio_role(dongle_fl_index()) == BRIDGE_ROLE_ZWAVE) {
         strlcpy(why, "Z-Wave radios are passed through: update a Z-Wave stick from Z-Wave JS", why_len);
+        busy_give();
         return false;
     }
     if (k != IMG_GBL && settings_radio_role(dongle_fl_index()) == BRIDGE_ROLE_THREAD) {
         snprintf(why, why_len, "%s firmware is Zigbee: set the radio's role to Zigbee2MQTT or ZHA first", xf_kind_name(k));
-        return false;
-    }
-    if (!busy_take()) {
-        strlcpy(why, "The stick is already being flashed", why_len);
+        busy_give();
         return false;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -772,9 +788,11 @@ void ncpflash_add_json(cJSON *root) {
     bool have;
     meta_t m;
     bool is_signed, encrypted;
+    nf_gbl_t app;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     h = s_hdr;
     m = s_meta;
+    app = s_app;
     is_signed = s_signed;
     encrypted = s_encrypted;
     *fs = s_fs;
@@ -837,7 +855,8 @@ void ncpflash_add_json(cJSON *root) {
         if (m.baud) cJSON_AddNumberToObject(im, "image_baud", m.baud);
         if (m.flow[0]) cJSON_AddStringToObject(im, "flow", m.flow);
         char pbuf[160];
-        const char *p = meta_problem(&m, cfg.baud, pbuf, sizeof(pbuf));
+        const char *p = nf_gbl_app_problem(&app, expect_now());
+        if (!p) p = meta_problem(&m, cfg.baud, pbuf, sizeof(pbuf));
         if (p) cJSON_AddStringToObject(im, "problem", p);
         link_change_t lc = link_after(&m, &cfg);
         if (lc.baud) cJSON_AddNumberToObject(im, "sets_baud", lc.baud);

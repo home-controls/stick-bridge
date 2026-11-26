@@ -56,27 +56,49 @@ static int f_read(void *ctx, uint32_t off, void *buf, size_t n) { return esp_par
 static int f_write(void *ctx, uint32_t off, const void *buf, size_t n) {
     return esp_partition_write(ctx, off, buf, n) == ESP_OK ? 0 : -1;
 }
-static int f_erase(void *ctx, uint32_t off, size_t n) { return esp_partition_erase_range(ctx, off, n) == ESP_OK ? 0 : -1; }
+// Each sector erase stops the caches on both cores (this chip has no erase suspend in ESP-IDF), so the USB driver
+// can't take the sticks' data meanwhile: counted and timed for the dashboard, to compare with any overflow counts.
+static uint32_t s_erases, s_erase_max_us;
+static uint64_t s_erase_sum_us;
+static int f_erase(void *ctx, uint32_t off, size_t n) {
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t e = esp_partition_erase_range(ctx, off, n);
+    uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+    s_erases++;
+    s_erase_sum_us += dt;
+    if (dt > s_erase_max_us) s_erase_max_us = dt;
+    return e == ESP_OK ? 0 : -1;
+}
 
 // The firmware is built for 16 MB (so the same image runs on any board), and ESP-IDF limits itself to that.
 // A bigger chip that the driver can address with 4-byte commands gets its upper part used for the log, after
 // proving that a write up there lands up there and not on the same spot in the lower 16 MB (a chip that
 // ignores the top address bits would otherwise overwrite the firmware). The probe sector is the last one, whose
 // lower twin (0xFFF000) is unused flash.
+// A chip that decodes only N address bits puts the probe on probe mod 2^N: every such twin from 16 MB up to the chip's
+// size is checked (a 64 MB part decoding 25 bits would pass a 16 MB-only check, and its log would overwrite the
+// firmware from 32 MB on).
+#define MAX_TWINS 8
 static bool upper_usable(esp_flash_t *ch, uint32_t phys) {
-    uint32_t probe = phys - LS_SECTOR, twin = probe - BUILT_FOR;
-    uint8_t pat[32], back[32], twin_before[32], twin_after[32];
+    uint32_t probe = phys - LS_SECTOR, twin[MAX_TWINS];
+    int nt = 0;
+    for (uint64_t span = BUILT_FOR; span < phys && nt < MAX_TWINS; span <<= 1) twin[nt++] = probe & (uint32_t)(span - 1);
+    static uint8_t before[MAX_TWINS][32];  // static: this runs once, on the main task's small stack
+    uint8_t pat[32], back[32], after[32];
     esp_fill_random(pat, sizeof(pat));
-    if (esp_flash_read(ch, twin_before, twin, sizeof(twin_before)) != ESP_OK) return false;
+    for (int i = 0; i < nt; i++)
+        if (esp_flash_read(ch, before[i], twin[i], sizeof(before[i])) != ESP_OK) return false;
     if (esp_flash_erase_region(ch, probe, LS_SECTOR) != ESP_OK) return false;
     if (esp_flash_write(ch, pat, probe, sizeof(pat)) != ESP_OK) return false;
     if (esp_flash_read(ch, back, probe, sizeof(back)) != ESP_OK || memcmp(back, pat, sizeof(pat)) != 0) {
         ESP_LOGW(TAG, "Flash above 16 MB doesn't read back what was written");
         return false;
     }
-    if (esp_flash_read(ch, twin_after, twin, sizeof(twin_after)) != ESP_OK || memcmp(twin_after, twin_before, sizeof(twin_after)) != 0) {
-        ESP_LOGW(TAG, "Flash above 16 MB wraps onto the lower 16 MB: not used");
-        return false;
+    for (int i = 0; i < nt; i++) {
+        if (esp_flash_read(ch, after, twin[i], sizeof(after)) != ESP_OK || memcmp(after, before[i], sizeof(after)) != 0) {
+            ESP_LOGW(TAG, "Flash above 16 MB wraps onto 0x%08lx: not used", (unsigned long)twin[i]);
+            return false;
+        }
     }
     esp_flash_erase_region(ch, probe, LS_SECTOR);
     return true;
@@ -286,6 +308,13 @@ static void writer_task(void *arg) {
             uint32_t next;
             size_t n = logbuf_read(from, in, 4096, &next);
             if (!n) break;
+            // The ring wrapped under a slow write: logbuf_read started at the oldest byte it still has, not at from.
+            uint32_t start = next - (uint32_t)n;
+            if (start != from) {
+                note(s_boot_epoch_ms, s_last_ms, "%lu bytes of log were lost (written faster than they could be saved)",
+                     (unsigned long)(start - from));
+                from = start;
+            }
             size_t used = store_lines(in, n, s_boot_epoch_ms, &s_last_ms, out, 8192, false);
             if (!used) break;  // a partial line: the rest comes later
             from += used;
@@ -298,6 +327,7 @@ static void writer_task(void *arg) {
 
 void logstore_start(void) {
     s_lock = xSemaphoreCreateMutex();
+    sdlog_init();
     s_boot_no = next_boot_no();
     pick_area();
     if (!s_part) {
@@ -346,6 +376,9 @@ void logstore_add_json(cJSON *root) {
         cJSON_AddNumberToObject(f, "used", ls_used(&s_ring));
         cJSON_AddNumberToObject(f, "oldest", (double)oldest_stamp());
         cJSON_AddNumberToObject(f, "write_errors", s_write_errors);
+        cJSON_AddNumberToObject(f, "erases", s_erases);  // this boot
+        cJSON_AddNumberToObject(f, "erase_max_ms", s_erase_max_us / 1000.0);
+        cJSON_AddNumberToObject(f, "erase_avg_ms", s_erases ? (double)s_erase_sum_us / s_erases / 1000.0 : 0);
         xSemaphoreGive(s_lock);
         cJSON_AddNumberToObject(f, "pending", logbuf_total() - logbuf_flushed());
     }

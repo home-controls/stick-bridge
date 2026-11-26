@@ -85,12 +85,16 @@ static void tick(void *arg) {
             s_lacc.rtt_cmds += c;
         }
         if (h->rtt_max_x10 > s_lacc.rtt_max) s_lacc.rtt_max = h->rtt_max_x10;
-        // a point per whole 10 s of uptime (aligned, so the dashboard's buckets never shift)
-        if (h->t % LHIST_STEP == 0 && s_lacc.n) {
+        // a point per whole 10 s of uptime (aligned, so the dashboard's buckets never shift); by bucket, not t % 10 == 0:
+        // a tick that runs late catches up with the same t twice, and the multiple of 10 would be skipped
+        static uint32_t s_lbucket;
+        uint32_t bucket = h->t / LHIST_STEP;
+        if (bucket != s_lbucket && s_lacc.n) {
+            s_lbucket = bucket;
             hist_t *l = &s_lhist[s_lhist_head];
             uint32_t n = s_lacc.n;
 #define CLAMP16(v) ((v) > 0xFFFF ? 0xFFFF : (uint16_t)(v))
-            l->t = h->t;
+            l->t = bucket * LHIST_STEP;
             l->bps_in = CLAMP16(s_lacc.in / n);
             l->bps_out = CLAMP16(s_lacc.out / n);
             l->zb_rx = CLAMP16(s_lacc.rx);

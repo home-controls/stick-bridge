@@ -6,8 +6,13 @@
 
 static const char *TAG = "usbser";
 
+// Called before every control request (each can wait up to 5 s on a stick that stopped answering): dongle.c feeds the
+// task watchdog here when its own task is the one asking, so a stick's slow setup can't restart the whole bridge.
+__attribute__((weak)) void us_before_request(void) {}
+
 static esp_err_t req(us_port_t *p, uint8_t type, uint8_t r, uint16_t v, uint16_t idx, uint16_t len, uint8_t *data) {
     if (!p->h) return ESP_ERR_INVALID_STATE;
+    us_before_request();
     return cdc_acm_host_send_custom_request(p->h, type, r, v, idx, len, data);
 }
 
@@ -124,6 +129,7 @@ esp_err_t us_set_baud(us_port_t *p, uint32_t baud) {
         case US_FTDI: return ft_baud(p, baud);
         case US_CDC: {
             cdc_acm_line_coding_t lc = {.dwDTERate = baud, .bCharFormat = 0, .bParityType = 0, .bDataBits = 8};
+            us_before_request();  // a class request (not through req()): up to 5 s too
             return cdc_acm_host_line_coding_set(p->h, &lc);
         }
         default: return ESP_ERR_NOT_SUPPORTED;
@@ -138,7 +144,7 @@ esp_err_t us_set_lines(us_port_t *p, bool dtr, bool rts) {
             return req(p, CH_OUT, CH_MODEM_CTRL, (uint16_t)~bits, 0, 0, NULL);  // active low
         }
         case US_FTDI: return req(p, FT_OUT, FT_MODEM_CTRL, (uint16_t)(0x0300 | (dtr ? 1 : 0) | (rts ? 2 : 0)), 0, 0, NULL);
-        case US_CDC: return cdc_acm_host_set_control_line_state(p->h, dtr, rts);
+        case US_CDC: us_before_request(); return cdc_acm_host_set_control_line_state(p->h, dtr, rts);
         default: return ESP_ERR_NOT_SUPPORTED;
     }
 }

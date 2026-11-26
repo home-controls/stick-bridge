@@ -82,8 +82,25 @@ def main() -> int:
     d4 = bytearray(d); d4[6] |= 1; bad.write_bytes(d4)
     r = run(bad, 1)
     check("encrypted refused", r.returncode == 1 and b"encrypted" in r.stderr, r.stderr)
+    # zip bombs and lying sizes: refused from the header, or as soon as the output passes what it said
+    d5 = bytearray(d); d5[22:26] = b"\0\0\0\0"; bad.write_bytes(d5)
+    r = run(bad, 1)
+    check("size 0 in the header refused (zip bomb)", r.returncode == 1 and b"how big" in r.stderr, r.stderr)
+    d6 = bytearray(d); d6[22:26] = (5 * 1024 * 1024).to_bytes(4, "little"); bad.write_bytes(d6)
+    r = run(bad, 1)
+    check("more than 4 MB in the header refused", r.returncode == 1 and b"more than any stick image" in r.stderr, r.stderr)
+    d7 = bytearray(d); d7[22:26] = (1000).to_bytes(4, "little"); bad.write_bytes(d7)
+    r = run(bad, 1)
+    check("output past a small header size refused", r.returncode == 1 and b"bigger than its header" in r.stderr, r.stderr)
+    bomb = mk("bomb.zip", zipfile.ZIP_DEFLATED, b"\n" * (6 * 1024 * 1024))
+    r = run(bomb, 1)
+    check(f"real 6 MB bomb ({bomb.stat().st_size} bytes zipped) refused", r.returncode == 1 and b"more than any stick image" in r.stderr, r.stderr)
+    # name + extra past 64 KB in total: the 16-bit sum used to wrap and misplace the data
+    d8 = bytearray(d); d8[28:30] = (0xFFFF).to_bytes(2, "little"); bad.write_bytes(d8)
+    r = run(bad, 1)
+    check("huge extra field doesn't wrap (fails cleanly)", r.returncode == 1, r.stderr)
     # real release
-    real = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+    real =Path(sys.argv[1]) if len(sys.argv) > 1 else None
     if real is None:
         try:
             req = urllib.request.Request(REAL, headers={"User-Agent": "zigbee-eth-bridge-test"})

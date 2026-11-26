@@ -37,7 +37,9 @@ typedef struct {
 // GBL application types (application info tag)
 #define NF_APP_ZIGBEE 0x01
 #define NF_APP_THREAD 0x02
+#define NF_APP_FLEX 0x04
 #define NF_APP_BLUETOOTH 0x08
+#define NF_APP_MCU 0x10
 
 typedef struct {
     uint32_t tag_len;  // bytes up to and including the end tag: what is sent to the dongle
@@ -58,9 +60,12 @@ typedef struct {
 } nf_ncp_t;
 
 // Checks a GBL v3 file read through io->image_read: structure, every tag known, CRC-32, firmware inside,
-// nothing that rewrites the bootloader or secure element, and Zigbee if it says what it is.
-// NULL when it's fine, else the reason.
+// nothing that rewrites the bootloader or secure element. NULL when it's fine, else the reason.
 const char *nf_gbl_check(const nf_io_t *io, uint32_t size, nf_gbl_t *out);
+// Whether a checked image's application type fits what the radio is for (expect: NF_EXPECT_*, defined below):
+// a Zigbee coordinator wants a Zigbee app, an OpenThread RCP a Thread or MCU one. NULL when it fits or the image
+// doesn't say.
+const char *nf_gbl_app_problem(const nf_gbl_t *g, uint8_t expect);
 
 // Opens an ASH session at baud and asks the firmware for its EZSP version.
 bool nf_ncp_probe(const nf_io_t *io, uint32_t baud, nf_ncp_t *out);

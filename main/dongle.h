@@ -85,7 +85,8 @@ bool dx_ready(dongle_t *d);
 bool dx_identified(dongle_t *d);  // a supported USB serial adapter has been seen for it (open or not)
 // Blocking write (up to timeout_ms). ESP_ERR_INVALID_STATE when not connected. Paced: at most 64-byte USB
 // transfers with idle line between back-to-back ones, held while the NCP says XOFF (txpace_core.h).
-esp_err_t dx_write(dongle_t *d, const uint8_t *data, size_t len, uint32_t timeout_ms);
+// *sent (may be NULL): the bytes that went to the stick, also when the write timed out partway.
+esp_err_t dx_write(dongle_t *d, const uint8_t *data, size_t len, uint32_t timeout_ms, size_t *sent);
 StreamBufferHandle_t dx_rx_stream(dongle_t *d);
 void dx_flush_rx(dongle_t *d);  // drop anything buffered from before the current client connected
 bool dx_claimed(dongle_t *d);

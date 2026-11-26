@@ -255,6 +255,7 @@ static void t_xoff_repeated_until_deadline(void) {
     int64_t t0 = m.now;
     for (int i = 0; i < 30; i++) schedule(&m, t0 + 100 + i * 4000, TP_XOFF);  // keeps re-arming
     CHECK(tp_write(&s, &io, d, n, 50) == TP_ERR_TIMEOUT, "gives up at the write timeout");
+    CHECK(s.last_sent < n, "says how much went before it gave up (%u of %u)", (unsigned)s.last_sent, (unsigned)n);
     CHECK(m.now - t0 <= 51000, "within the 50 ms timeout (%lld)", (long long)(m.now - t0));
     CHECK(s.st.write_errors == 1, "counted");
 }

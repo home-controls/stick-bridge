@@ -19,11 +19,12 @@
 #include "usb/usb_host.h"
 #include "usbser.h"
 #include "watchdog.h"
+#include "ncpflash.h"
 
 static const char *TAG = "dongle";
 
-#define LINE_POLL_MS 10        // CTS sample period
-#define LINE_STATUS_EVERY 10   // UART status every 10th sample (100 ms)
+#define LINE_POLL_MS 100       // CTS sample period (each is a USB control transfer on the stick's default pipe)
+#define LINE_STATUS_EVERY 10   // UART status every 10th sample (1 s)
 #define RX_STREAM_SIZE (16 * 1024)
 #define FLOW_XON BIT0  // set while the NCP has not said XOFF
 
@@ -60,6 +61,7 @@ struct dongle {
     SemaphoreHandle_t mon_lock;
     volatile bool hw_flow;  // CTS handshake on right now
     volatile bool hw_pref;  // what the settings ask for
+    volatile bool scan_xoff;  // 0x11/0x13 are flow control here (EZSP/ASH, Spinel), not data (ZNP, Z-Wave, ...)
     uint8_t ftdi_buf[64];
 };
 
@@ -88,6 +90,23 @@ static uint8_t s_seen[128];
 #define NOTIFY_GONE BIT1
 #define NOTIFY_REFORCE BIT2
 #define NOTIFY_SET_UP BIT3
+
+// The dongle task is on the task watchdog: waiting for a lock another task holds across a slow USB control transfer
+// (up to 5 s each, two in a row on a stick that stopped answering) feeds it meanwhile instead of restarting the bridge.
+static void lock_fed(SemaphoreHandle_t s) {
+    if (xTaskGetCurrentTaskHandle() != s_task) {
+        xSemaphoreTake(s, portMAX_DELAY);
+        return;
+    }
+    while (xSemaphoreTake(s, pdMS_TO_TICKS(1000)) != pdTRUE) watchdog_feed();
+}
+
+void us_before_request(void) {
+    if (s_task && xTaskGetCurrentTaskHandle() == s_task) watchdog_feed();
+}
+
+static bool proto_is_xonxoff(proto_t p) { return p == PROTO_EZSP || p == PROTO_SPINEL; }
+static void flow_line_reset(dongle_t *d);
 
 dongle_t *dongle_at(int radio) { return &s_d[radio < 0 || radio >= RADIO_MAX ? 0 : radio]; }
 StreamBufferHandle_t dx_rx_stream(dongle_t *d) { return d->rx; }
@@ -122,7 +141,11 @@ void dongle_rematch(void) {
 void dx_note_proto(dongle_t *d, proto_t p) {
     portENTER_CRITICAL(&d->id_mux);
     d->info.proto_detected = p;
+    proto_t expect = d->info.model ? d->info.model->proto : PROTO_UNKNOWN;
     portEXIT_CRITICAL(&d->id_mux);
+    bool scan = proto_is_xonxoff(p != PROTO_UNKNOWN ? p : expect);
+    if (d->scan_xoff && !scan) flow_line_reset(d);  // a 0x13 taken for XOFF must not keep holding writes
+    d->scan_xoff = scan;
 }
 
 void dx_request_set_up(dongle_t *d) {
@@ -172,6 +195,8 @@ static void flow_line_reset(dongle_t *d) {
 }
 
 void dx_flush_rx(dongle_t *d) {
+    // FreeRTOS refuses the reset while the radio's send task waits on the stream (most of the time); that's fine: with
+    // no client that task drops whatever comes in, so the stream is already near empty when a client connects.
     if (d->rx) xStreamBufferReset(d->rx);
     flow_line_reset(d);  // a new client starts with no stale XOFF
 }
@@ -193,7 +218,7 @@ static bool on_rx(const uint8_t *data, size_t len, void *arg) {
     }
     // XON/XOFF stay in the stream (Zigbee2MQTT's ASH layer reads them too); they also gate radio 1's writes. Radios
     // 2 and 3 don't hold on XOFF, and 0x13 is ordinary data in the Z-Wave Serial API: no scan there.
-    if (d->idx == 0 && (memchr(data, TP_XOFF, len) || memchr(data, TP_XON, len))) {
+    if (d->idx == 0 && d->scan_xoff && (memchr(data, TP_XOFF, len) || memchr(data, TP_XON, len))) {
         portENTER_CRITICAL(&d->tp_mux);
         bool changed = tp_rx(&d->tp, data, len, esp_timer_get_time());
         bool xoff = d->tp.xoff;
@@ -340,7 +365,7 @@ static void identify(usb_device_handle_t usb_dev) {
         return;
     }
 
-    xSemaphoreTake(s_assign_lock, portMAX_DELAY);
+    lock_fed(s_assign_lock);
     for (int i = 0; i < RADIO_MAX; i++) {
         if (s_d[i].have_target && s_d[i].info.usb_addr == addr) {  // already ours (scan saw it again)
             xSemaphoreGive(s_assign_lock);
@@ -382,6 +407,7 @@ static void identify(usb_device_handle_t usb_dev) {
     portENTER_CRITICAL(&d->id_mux);
     d->info = di;
     portEXIT_CRITICAL(&d->id_mux);
+    d->scan_xoff = proto_is_xonxoff(di.model->proto);
     d->ident = id;
     d->last_port = id.port;
     d->gone = false;
@@ -514,7 +540,7 @@ static void try_open(dongle_t *d) {
         return;
     }
     // on_rx reads port.chip (FTDI stripping) from the first byte on
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     d->port = p;
     xSemaphoreGive(d->tx_lock);
     e = us_setup(&d->port, d->baud);
@@ -524,8 +550,8 @@ static void try_open(dongle_t *d) {
         snprintf(msg, sizeof(msg), "stick found, but its USB-UART (%s) setup failed (%s)", us_chip_name(i.chip),
                  esp_err_to_name(e));
         set_err(d, msg);
-        xSemaphoreTake(d->tx_lock, portMAX_DELAY);
-        xSemaphoreTake(d->mon_lock, portMAX_DELAY);
+        lock_fed(d->tx_lock);
+        lock_fed(d->mon_lock);
         us_close(&d->port);
         xSemaphoreGive(d->mon_lock);
         xSemaphoreGive(d->tx_lock);
@@ -565,7 +591,7 @@ static void try_open(dongle_t *d) {
 static void close_dongle(dongle_t *d, bool may_free) {
     d->ready = false;
     d->gone = false;
-    xSemaphoreTake(s_assign_lock, portMAX_DELAY);
+    lock_fed(s_assign_lock);
     if (d->have_target) s_seen[d->info.usb_addr] = SEEN_NONE;
     bool was = d->have_target;
     d->have_target = false;
@@ -579,8 +605,8 @@ static void close_dongle(dongle_t *d, bool may_free) {
     set_err(d, "");
     if (was) retry_refused();  // a stick refused for want of a free radio may take this one now
     if (d->port.h == NULL) return;
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
-    xSemaphoreTake(d->mon_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
+    lock_fed(d->mon_lock);
     us_close(&d->port);
     d->hw_flow = false;
     xSemaphoreGive(d->mon_lock);
@@ -618,7 +644,7 @@ static void close_dongle(dongle_t *d, bool may_free) {
 static void free_stale(void) {
     radio_slot_t slots[RADIO_MAX];
     bool bound[RADIO_MAX], su[RADIO_MAX], present[RADIO_MAX];
-    xSemaphoreTake(s_assign_lock, portMAX_DELAY);
+    lock_fed(s_assign_lock);
     settings_radio_slots(slots);
     for (int i = 0; i < RADIO_MAX; i++) {
         bound[i] = !radio_ident_empty(&slots[i].bound);
@@ -645,7 +671,7 @@ static void adopt(dongle_t *d) {
     settings_radio_adopt(d->idx, &id, kind_of(i.model->proto), i.model->baud);
     uint32_t baud = settings_radio_baud(d->idx);
     if (d->port.h) dx_set_link_baud(d, baud);  // can't happen (try_open waits for adopt), but never run at the old baud
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     d->baud = baud;
     d->tp.cfg.baud = baud;
     xSemaphoreGive(d->tx_lock);
@@ -798,7 +824,7 @@ static void usb_lib_task(void *arg) {
 
 static esp_err_t write_raw(dongle_t *d, const uint8_t *data, size_t len, uint32_t timeout_ms) {
     if (!d->ready) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     esp_err_t e = d->port.h ? cdc_acm_host_data_tx_blocking(d->port.h, data, len, timeout_ms) : ESP_ERR_INVALID_STATE;
     xSemaphoreGive(d->tx_lock);
     return e;
@@ -855,13 +881,18 @@ static const tp_io_t s_tp_io = {
     .unlock = io_unlock,
 };
 
-esp_err_t dx_write(dongle_t *d, const uint8_t *data, size_t len, uint32_t timeout_ms) {
+esp_err_t dx_write(dongle_t *d, const uint8_t *data, size_t len, uint32_t timeout_ms, size_t *sent) {
+    if (sent) *sent = 0;
     if (d->claimed) return ESP_ERR_INVALID_STATE;  // the flasher has it
     if (!d->ready) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    // Bounded: the line may be held by a settings change waiting on a stick that stopped answering, and the radio's
+    // receive task (the caller) is on the task watchdog. A timeout is one failed write, not a restart.
+    if (xSemaphoreTake(d->tx_lock, pdMS_TO_TICKS(timeout_ms + 1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     tp_io_t io = s_tp_io;
     io.ctx = d;
+    d->tp.last_sent = 0;
     int rc = d->port.h ? tp_write(&d->tp, &io, data, len, timeout_ms) : TP_ERR_WRITE;
+    if (sent) *sent = d->tp.last_sent;
     bool stalled = rc == TP_ERR_TIMEOUT && d->hw_flow && d->port.h;
     if (stalled) {
         // The radio held CTS off long enough to time a write out: never leave the link stuck on that.
@@ -885,7 +916,7 @@ static esp_err_t set_hw_flow(dongle_t *d, bool on, char *err, size_t err_len) {
         if (on) snprintf(err, err_len, "No stick connected; it will be tried when the stick connects");
         return on ? ESP_ERR_INVALID_STATE : ESP_OK;
     }
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     esp_err_t e = ESP_OK;
     if (on) {
         bool cts = false;
@@ -915,7 +946,7 @@ static esp_err_t set_hw_flow(dongle_t *d, bool on, char *err, size_t err_len) {
 }
 
 static void set_flow(dongle_t *d, uint16_t chunk, uint16_t gap_us, bool xoff_honor, uint16_t xoff_max_ms) {
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     d->tp.cfg.chunk = chunk > TP_CHUNK_MAX ? TP_CHUNK_MAX : chunk;
     d->tp.cfg.gap_us = gap_us;
     d->tp.cfg.xoff_honor = xoff_honor;
@@ -938,7 +969,7 @@ static void dx_flow_stats(dongle_t *d, dongle_flow_t *out) {
 }
 
 static void dx_flow_reset_stats(dongle_t *d) {
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     portENTER_CRITICAL(&d->tp_mux);
     memset(&d->tp.st, 0, sizeof(d->tp.st));
     dongle_line_t keep = d->line;
@@ -951,7 +982,7 @@ static void dx_flow_reset_stats(dongle_t *d) {
 }
 
 static void dx_set_app_baud(dongle_t *d, uint32_t baud) {
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     d->baud = baud;
     d->tp.cfg.baud = baud;  // pacing times chunks against the line
     xSemaphoreGive(d->tx_lock);
@@ -959,7 +990,7 @@ static void dx_set_app_baud(dongle_t *d, uint32_t baud) {
 }
 
 esp_err_t dx_forget(dongle_t *d, char *err, size_t err_len) {
-    xSemaphoreTake(s_assign_lock, portMAX_DELAY);
+    lock_fed(s_assign_lock);
     bool busy = d->have_target || d->adopt_pending || d->bind_pending || d->claimed;
     if (!busy) settings_radio_free(d->idx);
     xSemaphoreGive(s_assign_lock);
@@ -974,7 +1005,7 @@ esp_err_t dx_forget(dongle_t *d, char *err, size_t err_len) {
 
 esp_err_t dx_set_link_baud(dongle_t *d, uint32_t baud) {
     if (d->claimed) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     esp_err_t e = d->port.h ? us_set_baud(&d->port, baud) : ESP_OK;
     if (e == ESP_OK) {
         d->baud = baud;
@@ -1005,8 +1036,11 @@ static dongle_t *fl(void) { return &s_d[s_fl]; }
 
 bool dongle_fl_select(int radio) {
     if (radio < 0 || radio >= RADIO_MAX) return false;
+    // A flash (or an upload, which is checked against the picked radio's stick) holds the pick from its first check
+    // to its last save: only "the same radio" is fine meanwhile.
+    if (ncpflash_busy()) return radio == s_fl;
     for (int i = 0; i < RADIO_MAX; i++)
-        if (s_d[i].claimed) return radio == s_fl;  // a flash is running: only "the same radio" is fine
+        if (s_d[i].claimed) return radio == s_fl;
     s_fl = radio;
     return true;
 }
@@ -1024,7 +1058,7 @@ bool dongle_claim(void) {
     xStreamBufferReset(s_claim_rx);
     d->claimed = true;
     if (d->hw_flow) {
-        xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+        lock_fed(d->tx_lock);
         if (d->port.h) us_set_cts_flow(&d->port, false);
         d->hw_flow = false;
         xSemaphoreGive(d->tx_lock);
@@ -1043,7 +1077,7 @@ typedef enum { FL_BAUD, FL_LINES, FL_GPIO } fl_op_t;
 static esp_err_t fl_ctl(fl_op_t op, uint32_t a, uint32_t b) {
     dongle_t *d = fl();
     if (!d->ready) return ESP_ERR_INVALID_STATE;
-    xSemaphoreTake(d->tx_lock, portMAX_DELAY);
+    lock_fed(d->tx_lock);
     esp_err_t e = ESP_ERR_INVALID_STATE;
     if (d->port.h) {
         if (op == FL_BAUD) e = us_set_baud(&d->port, a);

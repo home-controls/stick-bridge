@@ -41,6 +41,7 @@ static sd_pwr_ctrl_handle_t s_ldo;
 static uint32_t s_next_try, s_next_check, s_next_space;
 static bool s_powered, s_cycle_power;
 static uint64_t s_written;  // bytes written since the card was mounted
+static uint64_t s_dropped;  // bytes not written because the card was busy (a format) or full
 static uint32_t s_mounted_at;
 
 static uint32_t now_s(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
@@ -185,14 +186,21 @@ static void make_room(void) {
         if (free_b >= total / 20 && free_b >= 64ull * 1024 * 1024) return;
         DIR *d = opendir(DIR_PATH);
         if (!d) return;
-        char oldest[32] = "";
+        char oldest[32] = "", boot[32] = "";
+        unsigned long boot_no = 0;
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             size_t len = strlen(e->d_name);
-            if (len != 14 || strcmp(e->d_name + 10, ".log") != 0) continue;  // YYYY-MM-DD.log only
-            if (!oldest[0] || strcmp(e->d_name, oldest) < 0) memcpy(oldest, e->d_name, len + 1);
+            unsigned long b;
+            if (len == 14 && strcmp(e->d_name + 10, ".log") == 0) {  // YYYY-MM-DD.log
+                if (!oldest[0] || strcmp(e->d_name, oldest) < 0) memcpy(oldest, e->d_name, len + 1);
+            } else if (len < sizeof(boot) && sscanf(e->d_name, "boot-%lu.log", &b) == 1 && (!boot[0] || b < boot_no)) {
+                boot_no = b;  // a board whose clock was never set only writes these
+                memcpy(boot, e->d_name, len + 1);
+            }
         }
         closedir(d);
+        if (!oldest[0]) memcpy(oldest, boot, sizeof(oldest));
         if (!oldest[0]) return;
         char path[300];
         snprintf(path, sizeof(path), DIR_PATH "/%.255s", oldest);
@@ -201,9 +209,14 @@ static void make_room(void) {
     }
 }
 
+// Created once by sdlog_init (logstore_start, before the log writer and the web server start); ensure_lock only covers
+// a caller that comes first anyway.
 static void ensure_lock(void) {
-    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    static StaticSemaphore_t buf;
+    if (!s_lock) s_lock = xSemaphoreCreateMutexStatic(&buf);
 }
+
+void sdlog_init(void) { ensure_lock(); }
 
 void sdlog_poll(void) {
     ensure_lock();
@@ -227,7 +240,11 @@ void sdlog_poll(void) {
 void sdlog_append(const char *text, size_t n, int64_t epoch_ms, uint32_t boot_no) {
     if (s_state != SD_OK || !n) return;
     ensure_lock();
-    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(15000)) != pdTRUE) return;
+    // Short: the writer must keep up with the RAM log; only a format holds the card this long now.
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        s_dropped += n;
+        return;
+    }
     if (s_state == SD_OK) {
         char path[300];
         if (epoch_ms > 0) {
@@ -241,9 +258,18 @@ void sdlog_append(const char *text, size_t n, int64_t epoch_ms, uint32_t boot_no
         bool ok = f != NULL;
         if (ok) ok = fwrite(text, 1, n, f) == n;
         if (ok) ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+        int err = errno;
         if (f) fclose(f);
-        if (ok) s_written += n;
-        else lost("Writing to the card failed (removed?)");
+        if (ok) {
+            s_written += n;
+        } else if (err == ENOSPC) {
+            // Full is not removed: make room (oldest files first) and carry on, instead of power-cycling it forever.
+            s_dropped += n;
+            s_next_space = 0;
+            make_room();
+        } else {
+            lost("Writing to the card failed (removed?)");
+        }
     }
     xSemaphoreGive(s_lock);
 }
@@ -296,6 +322,7 @@ void sdlog_add_json(cJSON *root) {
         cJSON_AddStringToObject(sd, "card", s_card->cid.name);
         cJSON_AddNumberToObject(sd, "khz", s_card->real_freq_khz);
         cJSON_AddNumberToObject(sd, "written", (double)s_written);
+        cJSON_AddNumberToObject(sd, "dropped", (double)s_dropped);
         cJSON_AddNumberToObject(sd, "mounted_s", now_s() - s_mounted_at);
         static char names[MAX_FILES_LISTED][32];
         uint64_t bytes;
@@ -337,32 +364,52 @@ esp_err_t sdlog_send_file(httpd_req_t *req, const char *name, bool download) {
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_sendstr(req, "bad file name");
     }
-    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return httpd_resp_sendstr(req, "card busy");
-    }
-    esp_err_t e;
     char path[300];
     snprintf(path, sizeof(path), DIR_PATH "/%.255s", name);
-    FILE *f = s_state == SD_OK ? fopen(path, "r") : NULL;
-    if (!f) {
+    // The card lock is held per chunk (open, seek, read, close), never while a chunk goes out to the browser: a slow
+    // download must not stop the log writer (which waits at most 1 s, then drops the text). No stat() first: the first
+    // fopen is the check, so a file that goes (make_room) between check and use just ends the answer.
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    const size_t CHUNK = 8192;
+    char *buf = malloc(CHUNK);
+    esp_err_t e = buf ? ESP_OK : ESP_ERR_NO_MEM;
+    long off = 0;
+    bool started = false, missing = false;  // started: a chunk has gone out (after that a failure only cuts it short)
+    while (e == ESP_OK) {
+        size_t k = 0;
+        if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            e = ESP_ERR_TIMEOUT;
+            break;
+        }
+        bool card = s_state == SD_OK;
+        FILE *f = card ? fopen(path, "r") : NULL;
+        if (f && fseek(f, off, SEEK_SET) == 0) k = fread(buf, 1, CHUNK, f);
+        if (f) fclose(f);
         xSemaphoreGive(s_lock);
+        if (!f) {
+            missing = !started;
+            e = ESP_FAIL;
+            break;
+        }
+        if (k == 0) break;
+        if (!started && download) {
+            snprintf(disp, sizeof(disp), "attachment; filename=\"zigbee-bridge-%s\"", name);
+            httpd_resp_set_hdr(req, "Content-Disposition", disp);
+        }
+        off += (long)k;
+        e = httpd_resp_send_chunk(req, buf, k);
+        started = true;
+    }
+    free(buf);
+    if (missing) {
         httpd_resp_set_status(req, "404 Not Found");
         return httpd_resp_sendstr(req, s_state == SD_OK ? "no such file" : "no card");
     }
-    httpd_resp_set_type(req, "text/plain; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    if (download) {
-        snprintf(disp, sizeof(disp), "attachment; filename=\"zigbee-bridge-%s\"", name);
-        httpd_resp_set_hdr(req, "Content-Disposition", disp);
+    if (e != ESP_OK && !started) {  // nothing sent yet: answer with an error rather than nothing
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "the card is busy: try again");
     }
-    char *buf = malloc(4096);
-    e = buf ? ESP_OK : ESP_ERR_NO_MEM;
-    size_t k;
-    while (e == ESP_OK && (k = fread(buf, 1, 4096, f)) > 0) e = httpd_resp_send_chunk(req, buf, k);
-    fclose(f);
-    free(buf);
-    xSemaphoreGive(s_lock);
     if (e == ESP_OK) e = httpd_resp_send_chunk(req, NULL, 0);
     return e;
 }

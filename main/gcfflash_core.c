@@ -792,6 +792,9 @@ static res_t v3_upload(job_t *j) {
                 r->app_crc = s.appcrc;
                 r->app_crc_ok = s.appcrc == f->crc32;
                 logf_(io, "app checksum 0x%08X %s", (unsigned)s.appcrc, r->app_crc_ok ? "(OK)" : "(doesn't match the file's)");
+                // Logged, not enforced: whether the file's CRC field is the one the bootloader reports hasn't been seen on
+                // a real ConBee III (type 90 stores the header's), and refusing would leave the stick in its bootloader.
+                // The new firmware's version check after the flash still catches an image that didn't take.
                 return R_OK;
             }
         } else if (ev == E_GONE) {

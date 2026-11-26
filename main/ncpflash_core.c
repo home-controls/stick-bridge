@@ -200,12 +200,22 @@ const char *nf_gbl_check(const nf_io_t *io, uint32_t size, nf_gbl_t *g) {
     g->trailing = size - off;
     if (crc != GBL_CRC_RESIDUE) return "The image's CRC-32 doesn't match: the file is damaged";
     if (g->prog_bytes == 0 && !g->has_delta) return "The image has no firmware in it";
-    if (g->has_app_info && g->app_type != 0 && (g->app_type & NF_APP_ZIGBEE) == 0) {
-        if (g->app_type & NF_APP_THREAD) return "This is Thread firmware, not Zigbee";
-        if (g->app_type & NF_APP_BLUETOOTH) return "This is Bluetooth firmware, not Zigbee";
-        return "This firmware isn't Zigbee";
-    }
     return NULL;
+}
+
+const char *nf_gbl_app_problem(const nf_gbl_t *g, uint8_t expect) {
+    if (!g->has_app_info || g->app_type == 0) return NULL;  // doesn't say
+    if (expect == NF_EXPECT_SPINEL) {
+        // OpenThread RCP builds are tagged Thread (or MCU, as Simplicity Commander makes them)
+        if (g->app_type & (NF_APP_THREAD | NF_APP_MCU)) return NULL;
+        if (g->app_type & NF_APP_ZIGBEE) return "This is Zigbee firmware, not a Thread RCP: set the radio's role to Zigbee2MQTT or ZHA to use it";
+        if (g->app_type & NF_APP_BLUETOOTH) return "This is Bluetooth firmware, not a Thread RCP";
+        return "This firmware isn't a Thread RCP";
+    }
+    if (g->app_type & NF_APP_ZIGBEE) return NULL;
+    if (g->app_type & NF_APP_THREAD) return "This is Thread firmware, not Zigbee: set the radio's role to Thread to use it";
+    if (g->app_type & NF_APP_BLUETOOTH) return "This is Bluetooth firmware, not Zigbee";
+    return "This firmware isn't Zigbee";
 }
 
 // ---------------------------------------------------------------- ASH / EZSP (just enough to talk to EmberZNet)

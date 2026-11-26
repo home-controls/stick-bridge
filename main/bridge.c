@@ -41,6 +41,7 @@ typedef struct {
     volatile bool kick;
     char kick_why[64];
     bool dongle_was_ready;
+    bool warned_open;  // "anyone may connect" said once this start
     uint32_t last_refused_ip, last_refused_s;
     const char *last_refused_why;
 
@@ -62,9 +63,12 @@ static char s_names[RADIO_MAX][2][12];  // task names live as long as the tasks 
 static uint8_t s_hold0[2][HOLD_MAX];
 
 static void sniff_versions(link_t *l, const uint8_t *b, size_t n) {
-    if (!pd_ver_feed(&l->ver, b, n)) return;
     char run[80], ver[24];
-    if (!pd_ver_text(&l->ver, run, sizeof(run), ver, sizeof(ver))) return;
+    // session_begin resets l->ver from the receive task: feed and read it under the same lock
+    xSemaphoreTake(l->pd_lock, portMAX_DELAY);
+    bool learnt = pd_ver_feed(&l->ver, b, n) && pd_ver_text(&l->ver, run, sizeof(run), ver, sizeof(ver));
+    xSemaphoreGive(l->pd_lock);
+    if (!learnt) return;
     dx_note_fw(l->d, run, ver);
     l->sniff = false;  // known until the next session (a flash or a new client starts one)
     stats_event(EV_INFO, "Radio %d firmware: %s", l->idx + 1, run);
@@ -276,6 +280,12 @@ static void handle_accept(link_t *l) {
     char w[64];
     who(l, w, sizeof(w));
     stats_event_r(l->idx, EV_INFO, "%s connected from %s", w, ip);
+    // Whoever has this port has the radio (and its network key): say so once per start while anyone may connect.
+    if (settings_radio_open_to_all(l->idx) && !l->warned_open) {
+        l->warned_open = true;
+        stats_event_r(l->idx, EV_WARN, "Radio %d takes connections from any host on the network: set its allowed host to %s "
+                      "(Settings, Radios) so only that machine can reach the stick", l->idx + 1, ip);
+    }
     // From now on the radio is set up: if its stick goes, it waits for it (and says so) instead of being freed.
     // Saved by the dongle task: this task's stack is in PSRAM, which can't write flash.
     if (!settings_radio_is_set_up(l->idx)) dx_request_set_up(l->d);
@@ -289,13 +299,13 @@ static void client_to_stick(link_t *l, uint8_t *buf, size_t cap) {
         return;
     }
     observe(l, DIR_HOST, buf, n, esp_timer_get_time());
-    esp_err_t e = dx_write(l->d, buf, n, 1000);
+    size_t sent = 0;
+    esp_err_t e = dx_write(l->d, buf, n, 1000, &sent);
     stats_lock();
     radio_stats_t *rs = &g_radio[l->idx];
-    if (e == ESP_OK) {
-        rs->bytes_out += n;
-        rs->acc_out += n;
-    } else {
+    rs->bytes_out += sent;  // what reached the stick, also when a write timed out partway
+    rs->acc_out += sent;
+    if (e != ESP_OK) {
         rs->tx_errors++;
         if (l->idx == 0) g_stats.dongle_tx_errors++;
     }

@@ -140,6 +140,7 @@ int tp_write(tp_state_t *s, const tp_io_t *io, const uint8_t *data, size_t len, 
         off += n;
     }
 
+    s->last_sent = (uint32_t)off;
     if (rc != TP_OK) s->st.write_errors++;
     uint32_t took = (uint32_t)(io->now_us(io->ctx) - start);
     if (took > s->st.write_max_us) s->st.write_max_us = took;

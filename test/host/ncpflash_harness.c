@@ -139,7 +139,9 @@ int main(int argc, char **argv) {
     char out[2048], e1[600], e2[300], meta[1100];
     uint32_t size = (uint32_t)strtoul(argv[argc - 1], NULL, 10);
     nf_gbl_t g;
+    uint8_t expect = getenv("NF_EXPECT_SPINEL") ? NF_EXPECT_SPINEL : NF_EXPECT_EZSP;
     const char *why = nf_gbl_check(&io, size, &g);
+    if (!why) why = nf_gbl_app_problem(&g, expect);
     json_str(e1, sizeof(e1), why ? why : "");
     json_str(meta, sizeof(meta), g.metadata);
     if (strcmp(argv[1], "check") == 0 || why) {
@@ -154,7 +156,7 @@ int main(int argc, char **argv) {
         .app_baud = (uint32_t)strtoul(argv[2], NULL, 10),
         .new_baud = (uint32_t)strtoul(argv[3], NULL, 10),
         .upload_len = g.tag_len,
-        .expect = getenv("NF_EXPECT_SPINEL") ? NF_EXPECT_SPINEL : NF_EXPECT_EZSP,
+        .expect = expect,
     };
     nf_result_t r;
     char err[200];

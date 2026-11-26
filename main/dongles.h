@@ -62,8 +62,8 @@ typedef struct {
 // Entries from the downloadable list (dongles.json next to the release manifest), checked before the
 // built-in table. The array must stay valid for as long as it's set (the caller never frees an old one).
 void dongles_set_extra(const dongle_model_t *models, int n);
-int dongles_extra_count(void);
-const dongle_model_t *dongles_extra(void);
+// The downloaded list and its length, taken together (a list swapped meanwhile is never mixed with the other's count).
+const dongle_model_t *dongles_extra(int *n);
 // true when m came from the downloaded list
 bool dongle_is_extra(const dongle_model_t *m);
 // Name lookups for the JSON list ("ezsp", "rts_dtr", "silabs", ...): -1 when unknown.

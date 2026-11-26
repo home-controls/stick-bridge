@@ -118,6 +118,8 @@ static esp_http_client_handle_t gh_open(const char *url, bool api, int *status, 
             } else if (hop >= 4) *why = "too many redirects";
             else if (esp_http_client_set_redirection(c) != ESP_OK || esp_http_client_get_url(c, next, URL_MAX) != ESP_OK)
                 *why = "bad redirect";
+            else if (strncmp(next, "https://", 8) != 0)
+                *why = "redirected to a plain http address";  // downloads stay https all the way
             else {
                 esp_http_client_cleanup(c);
                 continue;

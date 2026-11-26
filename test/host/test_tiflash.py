@@ -114,6 +114,7 @@ class Chip:
         self.boot_gen = 0
         self.sd_seen = 0
         self.cmds = []
+        self.erase_order = []  # sectors, in the order SECTOR_ERASE asked for them
         self.entries = 0      # times the ROM started the bootloader
         self.boots_app = 0
         self.lied = False
@@ -342,6 +343,7 @@ class Chip:
             self.status = 0x41
 
     def erase_sector(self, s):
+        self.erase_order.append(s)
         if self.prot[s // 32] & (1 << (s % 32)):
             self.flash[s * SECTOR:(s + 1) * SECTOR] = b"\xff" * SECTOR
 
@@ -665,6 +667,11 @@ def ihex_tests():
            hex_line(2, 0, b"\x10\x00") + "\n" + hex_line(0, 0x0000, bytes(8)) + "\n" + hex_line(4, 0, b"\x00\x01") + "\n" +
            hex_line(0, 0x0004, bytes(8)) + "\n:00000001FF\n", err_has="overlaps")
     hcheck("record crossing a 64 KB boundary", hex_line(0, 0xFFF8, bytes(16)) + "\n:00000001FF\n", err_has="64 KB")
+    # Ends exactly at 4 GB: hi would wrap to 0 and a 32-bit caller's addr + n check with it (heap write before the buffer)
+    hcheck("record ending exactly at 4 GB refused",
+           hex_line(4, 0, b"\xFF\xFF") + "\n" + hex_line(0, 0xFF01, bytes(0xFF)) + "\n:00000001FF\n", err_has="past 4 GB")
+    hcheck("record ending just below 4 GB is fine",
+           hex_line(4, 0, b"\xFF\xFF") + "\n" + hex_line(0, 0xFF00, bytes(0xFF)) + "\n:00000001FF\n")
     frag = "".join(hex_line(0, i * 32, b"\xAA") + "\n" for i in range(33)) + ":00000001FF\n"
     hcheck("more than 32 separate ranges refused", frag, err_has="too fragmented")
     adj = "".join(hex_line(0, i * 4, b"\xAA" * 4) + "\n" for i in range(64)[::-1]) + ":00000001FF\n"
@@ -768,6 +775,10 @@ def main():
           else (r["skipped"], r["ff"], r["downloads"], r["bytes"]))
     flash("sector erase on request", img, Chip(), sector=True,
           extra=lambda r, d: None if r["erase_how"] == "sector erase" and d.cmds.count(0x26) == 44 else r["erase_how"])
+    # the CCFG sector first: cut off after any erase, the chip boots a blank CCFG (stays in the ROM bootloader)
+    flash("sector erase starts with the CCFG sector", img, Chip(), sector=True,
+          extra=lambda r, d: None if d.erase_order[:1] == [K352 // SECTOR - 1] and sorted(d.erase_order) == list(range(K352 // SECTOR))
+          else d.erase_order[:3])
     flash("chip's CCFG disables bank erase: sector erase instead", img,
           Chip(flash=make_image(seed=97, erase_conf=0xFFFFFFFE)),
           extra=lambda r, d: None if r["erase_how"] == "sector erase" and 0x2C not in d.cmds else r["erase_how"])
