@@ -2,6 +2,10 @@
 
 Each version's notes are what the bridge shows before installing it, so keep them under 500 bytes.
 
+## 2.1.3
+
+Security fixes (advisory GHSA-g7fj-vfx8-3h8f): every change now needs the dashboard's own request header, also when a browser sends a saved password, so another website can't change settings or install firmware; /metrics no longer makes browsers save the password; a download could write to freed memory. Please update.
+
 ## 2.1.2
 
 A quieter log: the web server closed each idle browser connection by cutting it off, and every cut logged "httpd_sock_err: error in recv : 128" (a few per dashboard visit). Idle connections now get a normal close first; only a client still holding on 5 s later is cut off, and only that one is logged.
