@@ -46,7 +46,7 @@ export function Auth({ state }: { state: AuthState }) {
   return (
     <div class="auth-wrap">
       <div class="dialog auth-card">
-        <div class="brand"><Logo size={28} /><span>Zigbee Bridge</span></div>
+        <div class="brand"><Logo size={28} /><span>Stick Bridge</span></div>
         <p class="muted small" style={{ margin: 0 }}>{state.hostname} · firmware {state.version}</p>
         <form onSubmit={submit}>
           {setup ? (

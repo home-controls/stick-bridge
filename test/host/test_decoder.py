@@ -231,7 +231,7 @@ def build(rnd: random.Random) -> Script:
 
     # callbacks: messages heard from five devices
     devs = {0x072F: (0x00124B0012345601, 160, -61), 0x3BE9: (0x00124B0012345602, 90, -79),
-            0x1A2B: (0x00124B0012345603, 40, -88), 0xC177: (0x10BDA3FFFEB12B68, 230, -50),
+            0x1A2B: (0x00124B0012345603, 40, -88), 0xC177: (0x00124B0000005604, 230, -50),
             0x0D9A: (0x0, 120, -70)}
     for rnd_round in range(4):
         for short, (ieee, lqi, rssi) in devs.items():

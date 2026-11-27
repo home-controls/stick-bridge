@@ -26,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent.parent  # the zigbee-bridge repo
+HERE = Path(__file__).resolve().parent.parent  # the stick-bridge repo
 IMAGE = HERE / "build" / "zigbee_eth_bridge.bin"
 # esp_image_header (24) + first segment header (8), then esp_app_desc_t: magic (4), secure_version (4),
 # reserved (8), version (32), project_name (32)
@@ -118,7 +118,7 @@ def main() -> None:
         if a.assets_only:
             print(f"wrote {len(files)} files to {out}")
             return
-        subprocess.run(["gh", "release", "create", f"v{version}", *files, "--title", f"Zigbee Bridge {version}",
+        subprocess.run(["gh", "release", "create", f"v{version}", *files, "--title", f"Stick Bridge {version}",
                         "--notes", a.notes.strip()], check=True, cwd=HERE)
         print("published the GitHub release")
         return

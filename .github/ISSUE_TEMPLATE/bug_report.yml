@@ -1,0 +1,48 @@
+name: Bug report
+description: Something on the bridge doesn't work as it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Security problem?** Don't file it here: use the Security tab's
+        private report (see SECURITY.md).
+
+        Before pasting logs: remove passwords, the API token, network keys, real IEEE addresses and public IPs.
+  - type: input
+    id: version
+    attributes:
+      label: Firmware version
+      description: System page, or the header's version.
+      placeholder: "2.1.2"
+    validations:
+      required: true
+  - type: input
+    id: sticks
+    attributes:
+      label: Sticks and their firmware
+      description: Model, and the firmware the bridge shows for each radio. Behind a USB hub?
+      placeholder: "SONOFF Dongle Plus MG24, EmberZNet 9.1.2, no hub"
+    validations:
+      required: true
+  - type: input
+    id: apps
+    attributes:
+      label: Apps using the bridge
+      placeholder: "Zigbee2MQTT 2.x on radio 1, ZHA on radio 2"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: System → log (Download) around the time it happened, cleaned of private data.
+      render: text

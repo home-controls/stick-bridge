@@ -23,7 +23,7 @@ sys.path.insert(0, str(SIM_DIR))
 import adapter_sim  # noqa: E402
 
 sim = adapter_sim.AdapterSim()
-sim.cfg.update({"update_url": "https://github.com/home-controls/zigbee-bridge/releases/latest/download/manifest.json", "update_auto": True,
+sim.cfg.update({"update_url": "https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json", "update_auto": True,
                 "tx_chunk": 64, "tx_gap_us": 300, "xoff_honor": True, "xoff_max_ms": 20, "hw_flow": False,
                 "fw_repo": "Nerivec/silabs-firmware-builder", "fw_prerelease": True, "role": "zigbee"})
 # Example LAN addresses (the README's): the bridge at .50, Home Assistant (where Zigbee2MQTT connects from) at .10
@@ -632,7 +632,7 @@ async def logs_text(r):
     if tail and len(t) > tail:
         t = t[-tail:]
         t = t[t.index("\n") + 1:]
-    headers = {"Content-Disposition": 'attachment; filename="zigbee-bridge-log.txt"'} if r.query.get("download") == "1" else {}
+    headers = {"Content-Disposition": 'attachment; filename="stick-bridge-log.txt"'} if r.query.get("download") == "1" else {}
     return web.Response(text=t, content_type="text/plain", headers=headers)
 
 

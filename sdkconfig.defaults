@@ -37,7 +37,7 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 # Plain log lines (the dashboard's live log parses them)
 CONFIG_LOG_COLORS=n
 
-# Updates from git over HTTPS (Cloudflare / Google Trust Services): the common CA bundle
+# Updates over HTTPS (GitHub and whatever source is set): the common CA bundle
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 CONFIG_ESP_TLS_USING_MBEDTLS=y

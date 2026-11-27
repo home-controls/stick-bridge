@@ -394,7 +394,7 @@ esp_err_t sdlog_send_file(httpd_req_t *req, const char *name, bool download) {
         }
         if (k == 0) break;
         if (!started && download) {
-            snprintf(disp, sizeof(disp), "attachment; filename=\"zigbee-bridge-%s\"", name);
+            snprintf(disp, sizeof(disp), "attachment; filename=\"stick-bridge-%s\"", name);
             httpd_resp_set_hdr(req, "Content-Disposition", disp);
         }
         off += (long)k;

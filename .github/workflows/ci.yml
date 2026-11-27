@@ -1,24 +1,39 @@
-# Host tests, the dashboard page, the firmware and the release files, on every push and pull request;
-# the release workflow runs this first and publishes the files it built. Read-only: no secrets.
+# Host tests, the dashboard page, the firmware and the release files, on every pull request and every push to
+# main; the release workflow runs this first and publishes the files it built. Read-only: no secrets.
+#
+# Runners: the organisation's self-hosted TrueNAS runner (ephemeral: a fresh container per job, label
+# "self-hosted") takes the runs this repository's own people start. Pull requests from forks and Dependabot's
+# run untrusted code, so they go to GitHub's hosted runners, never the self-hosted one; fork runs also wait for the
+# maintainer's approval (repository setting). The release workflow passes runner "ubuntu-24.04" so release files
+# are always built on GitHub's clean runners. The firmware job always runs hosted: it builds inside the pinned
+# ESP-IDF container, and the TrueNAS runner has no container runtime.
 name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      runner:
+        description: runs-on for the jobs that may use the self-hosted runner
+        type: string
+        required: false
+    secrets:
+      PRIVATE_PATTERNS:
+        required: false
 
 permissions: {}
 
 # a newer push to the same branch replaces a running check; a release's own run is never cancelled
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/') || github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow_ref }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   host-tests:
     name: Host tests (ASan + UBSan)
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner || ((github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]')) && 'ubuntu-24.04' || 'self-hosted') }}
     permissions:
       contents: read
     steps:
@@ -26,13 +41,18 @@ jobs:
         with:
           persist-credentials: false
       - name: Compiler and zlib
-        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends build-essential zlib1g-dev
+        run: |
+          if command -v cc >/dev/null && echo '#include <zlib.h>' | cc -E - >/dev/null 2>&1; then
+            echo "cc and zlib already there"
+          else
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends build-essential zlib1g-dev
+          fi
       - name: Tests
         run: python3 test/host/run_all.py
 
   web:
     name: Dashboard page
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner || ((github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]')) && 'ubuntu-24.04' || 'self-hosted') }}
     permissions:
       contents: read
     defaults:
@@ -58,18 +78,31 @@ jobs:
           fi
 
   checks:
-    name: Version, changelog, workflows
-    runs-on: ubuntu-24.04
+    name: Version, workflows, privacy
+    runs-on: ${{ inputs.runner || ((github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]')) && 'ubuntu-24.04' || 'self-hosted') }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # the privacy check reads the new commits' messages
       - name: The version has a changelog entry, short enough for the bridge to show
         run: python3 tools/release_info.py
       - name: Workflow security audit (zizmor)
-        run: pipx run zizmor==1.33.1 --persona regular --min-severity medium .github/workflows
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zizmor"
+          "$RUNNER_TEMP/zizmor/bin/pip" install -q zizmor==1.33.1
+          "$RUNNER_TEMP/zizmor/bin/zizmor" --persona regular --min-severity medium .github/workflows
+      # The patterns are private (secret PRIVATE_PATTERNS; locally ~/.config/stick-bridge/private-patterns.txt). Fork
+      # and Dependabot pull requests get no secrets, so only there may the check skip (it runs again on the push to
+      # main after the merge); anywhere else a missing secret fails it.
+      - name: Privacy check (files and the new commits)
+        env:
+          PRIVATE_PATTERNS: ${{ secrets.PRIVATE_PATTERNS }}
+          RANGE: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || format('{0}..{1}', github.event.before || '0000000', github.sha) }}
+          ALLOW: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || github.event.pull_request.user.login == 'dependabot[bot]') && '--allow-missing' || '' }}
+        run: node tools/privacy-check.mjs $ALLOW --range "$RANGE"
 
   firmware:
     name: Firmware
