@@ -1,0 +1,25 @@
+# Version updates as pull requests (security updates are on in the repository settings too).
+# ESP-IDF and its managed components (dependencies.lock) aren't something Dependabot can update: bump them by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    groups:
+      dashboard-build:
+        dependency-type: development
+      dashboard-runtime:
+        dependency-type: production
+    commit-message:
+      prefix: "web"

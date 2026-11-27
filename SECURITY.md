@@ -4,8 +4,20 @@ Found a security problem in this project? Please report it privately: on GitHub,
 **Security** tab of this repository and choose **Report a vulnerability**. Please don't open a public
 issue for it.
 
-You'll get an answer as soon as possible, and a fixed release with a note in the changelog once it is
-fixed.
+You'll get a first answer within a week, usually much sooner, and a fixed release with a note in the
+changelog once it is fixed. Reporters are credited in the advisory unless they'd rather not be.
+
+## Supported versions
+
+Only the latest release gets security fixes. Bridges update themselves from the dashboard
+(System → Updates), so please update before reporting.
+
+## How releases are protected
+
+Every release is built by GitHub Actions on GitHub's own runners from a tag on `main`, which only
+reviewed pull requests reach. Publishing waits for the maintainer's approval, and the release files
+come with signed build provenance (`gh attestation verify`, see the README). Tags and releases can't be
+replaced afterwards.
 
 ## What the bridge protects, and what it doesn't
 

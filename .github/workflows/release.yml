@@ -1,9 +1,11 @@
-# A release: push a tag v<version> (version.txt) on a commit that follows main.
-#   1. checks the tag against version.txt and CHANGELOG.md, and that main can move to it
-#   2. runs CI, which builds the firmware and the release files
-#   3. signs their build provenance (gh attestation verify <file> --repo <this repo>), moves main to
-#      the tag and makes the GitHub release; bridges see it at their next check, since they read
-#      releases/latest/download/manifest.json
+# A release: push a tag v<version> (version.txt) on a commit that is on main (merged through a pull request).
+# See docs/RELEASING.md.
+#   1. checks the tag against version.txt and CHANGELOG.md, and that the tagged commit is on main
+#   2. runs CI on GitHub's hosted runners (never the self-hosted one), which builds the firmware and the
+#      release files
+#   3. waits for the maintainer's approval (environment "release"), signs the files' build provenance
+#      (gh attestation verify <file> --repo <this repo>) and makes the GitHub release; bridges see it at their
+#      next check, since they read releases/latest/download/manifest.json
 # Run by hand (Actions, Release, Run workflow) it is a dry run: it builds everything and publishes nothing.
 name: Release
 
@@ -36,8 +38,8 @@ jobs:
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             version=$(python3 tools/release_info.py --tag "$GITHUB_REF_NAME")
-            if ! git merge-base --is-ancestor origin/main HEAD; then
-              echo "::error::$GITHUB_REF_NAME doesn't follow main, so main can't move to it: tag a commit on top of main"
+            if ! git merge-base --is-ancestor HEAD origin/main; then
+              echo "::error::$GITHUB_REF_NAME isn't on main: merge the release pull request first, then tag main"
               exit 1
             fi
             publish=true
@@ -47,7 +49,7 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
-          echo "Zigbee Bridge $version ($([ "$publish" = true ] && echo release || echo dry run))" >> "$GITHUB_STEP_SUMMARY"
+          echo "Stick Bridge $version ($([ "$publish" = true ] && echo release || echo dry run))" >> "$GITHUB_STEP_SUMMARY"
 
   ci:
     name: CI
@@ -55,17 +57,21 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
+    with:
+      runner: ubuntu-24.04
+    secrets:
+      PRIVATE_PATTERNS: ${{ secrets.PRIVATE_PATTERNS }}
 
   publish:
     name: Publish
     needs: [info, ci]
     if: needs.info.outputs.publish == 'true'
     runs-on: ubuntu-24.04
-    # Settings, Environments, release: add yourself as a required reviewer to approve each release by
-    # hand, and limit it to v* tags
+    # Settings, Environments, release: the maintainer is its required reviewer (each release waits for an
+    # approval) and only v* tags may use it
     environment: release
     permissions:
-      contents: write # move main, make the release
+      contents: write # make the release
       id-token: write # sign the build provenance
       attestations: write # store that signed provenance
     env:
@@ -74,7 +80,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: false # the push below gets the token for itself only
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-files
@@ -90,17 +96,10 @@ jobs:
           subject-path: |
             dist/*.bin
             dist/manifest.json
-      - name: Move main to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          echo "::add-mask::$auth"
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/main"
       - name: GitHub release (the bridges' update feed)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 tools/release_info.py --tag "$GITHUB_REF_NAME" --notes "$RUNNER_TEMP/notes.md" >/dev/null
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "Zigbee Bridge $VERSION" \
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "Stick Bridge $VERSION" \
             --notes-file "$RUNNER_TEMP/notes.md" dist/*

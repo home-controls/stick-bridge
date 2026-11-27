@@ -65,7 +65,7 @@ menu "Zigbee Ethernet bridge"
 
     config BRIDGE_DEFAULT_UPDATE_URL
         string "Release manifest on git (updates)"
-        default "https://github.com/home-controls/zigbee-bridge/releases/latest/download/manifest.json"
+        default "https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json"
 
     config BRIDGE_TEST_HOOKS
         bool "Test hooks (POST /api/debug/watchdog): never in a release"

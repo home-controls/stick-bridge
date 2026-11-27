@@ -1,10 +1,15 @@
-# Zigbee Bridge
+# Stick Bridge
 
-**Put your Zigbee coordinator on the network, wherever reception is best.**
+**Put your USB radio sticks on the network, wherever reception is best.**
 
-Your Zigbee USB stick usually has to sit right next to the Home Assistant box, often in a closet or
-behind a rack: not a great place for a radio. Zigbee Bridge is firmware for a small Ethernet board
-that the stick plugs into instead. Run one network cable (with power over it, if your switch does
+> Formerly **Zigbee Bridge** (`home-controls/zigbee-bridge`). Renamed because it bridges any radio
+> stick that talks over serial, not only Zigbee. Old links redirect here and bridges already in use
+> keep finding their updates; [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) lists the names that stay
+> the same on purpose.
+
+Your Zigbee, Thread or Z-Wave USB stick usually has to sit right next to the Home Assistant box, often
+in a closet or behind a rack: not a great place for a radio. Stick Bridge is firmware for a small
+Ethernet board that the stick plugs into instead. Run one network cable (with power over it, if your switch does
 PoE) to a central spot, and Zigbee2MQTT talks to the stick over the network as if it were still
 plugged in.
 
@@ -54,7 +59,7 @@ which devices it hears and how well, and warns you about trouble.
 ## Getting started
 
 1. **Flash the firmware** once over USB-C (later updates arrive over the network). Download
-   `zigbee_eth_bridge-<version>-full.bin` from the [latest release](https://github.com/home-controls/zigbee-bridge/releases/latest)
+   `zigbee_eth_bridge-<version>-full.bin` from the [latest release](https://github.com/home-controls/stick-bridge/releases/latest)
    and write it with [esptool](https://docs.espressif.com/projects/esptool/):
    `esptool --chip esp32p4 write_flash 0x0 zigbee_eth_bridge-<version>-full.bin`.
    Or build it yourself with ESP-IDF 5.5, see [the technical reference](docs/TECHNICAL.md#build-and-flash).
@@ -109,19 +114,25 @@ the app reconnects. **Forget** frees a radio for good.
 **Where are the details?** Hardware pins, the API, radios and hubs, the update process, flashing
 sticks, memory, the stored log, watchdogs and tests are all in [the technical reference](docs/TECHNICAL.md).
 
-## The Zigbee family
+## Works well with
 
-Zigbee Bridge is one of three apps that share one look:
+Stick Bridge shares its look with two Zigbee apps:
 
 | | |
 | --- | --- |
 | [Zigbee Studio](https://github.com/home-controls/zigbee-studio) | A fast page for Zigbee2MQTT; shows this bridge's health too |
 | [Zigbee Sniffer](https://github.com/home-controls/zigbee-sniffer) | Listen to your network with small ESP32 radios |
-| **Zigbee Bridge** | This one: your coordinator on Ethernet |
+| **Stick Bridge** | This one: your radio sticks on Ethernet |
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Every change
+reaches `main` through a reviewed pull request with passing checks. Security problems go through
+[SECURITY.md](SECURITY.md), never a public issue.
 
 ## How releases are made
 
-Every release is built by GitHub Actions from a tagged commit in this repository: the host tests
+Every release is built by GitHub Actions from a tagged commit on `main`: the host tests
 run, the firmware is built, and the release files come with a `SHA256SUMS` file and a signed record of
 how and from which commit they were built. The bridge itself checks an update's size, MD5 and SHA-256
 before it switches to it, and goes back to the old version if the new one doesn't start properly. To
@@ -129,10 +140,18 @@ check a download yourself, with the [GitHub CLI](https://cli.github.com/):
 
 ```
 sha256sum -c SHA256SUMS
-gh attestation verify zigbee_eth_bridge-<version>-full.bin --repo home-controls/zigbee-bridge
+gh attestation verify zigbee_eth_bridge-<version>-full.bin --repo home-controls/stick-bridge
 ```
+
+Releases up to 2.1.2 were built under the old name: verify those with `--repo home-controls/zigbee-bridge`.
+The files keep the `zigbee_eth_bridge` name because bridges check it before installing
+([why](docs/COMPATIBILITY.md)). How a release is cut: [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Zigbee and the Zigbee logo are trademarks of the Connectivity Standards
-Alliance; this project is not affiliated with or endorsed by it.
+The code is MIT, see [LICENSE](LICENSE). Third-party parts built into the firmware and their licences
+are listed in [NOTICE.md](NOTICE.md). The Zigbee logo in the dashboard is **not** covered by the MIT
+licence: forks must replace it.
+
+Zigbee and the Zigbee logo are trademarks of the Connectivity Standards Alliance, Thread of the Thread
+Group, Z-Wave of Silicon Labs. This project is not affiliated with or endorsed by any of them.

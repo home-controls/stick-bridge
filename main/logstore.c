@@ -392,7 +392,7 @@ esp_err_t logstore_send(httpd_req_t *req, uint32_t tail, bool download) {
     }
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    if (download) httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"zigbee-bridge-log.txt\"");
+    if (download) httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"stick-bridge-log.txt\"");
     char *buf = malloc(4096);
     if (!buf) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
     ls_cursor_t c;

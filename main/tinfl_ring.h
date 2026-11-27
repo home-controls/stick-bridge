@@ -1,5 +1,5 @@
 #pragma once
-// Adapter from miniz's tinfl (in the ESP32-P4 ROM; the host tests build it from miniz's source) to
+// Adapter from miniz's tinfl (in the ESP32-P4 ROM; the host tests use zlib in its place) to
 // unzip_core's pull interface: tinfl decompresses into a 32 KB ring (its LZ dictionary), and this hands the
 // ring's new bytes out in whatever pieces the caller asks for. Include after miniz.h.
 

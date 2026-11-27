@@ -1,11 +1,12 @@
-# Zigbee Bridge: technical reference
+# Stick Bridge: technical reference
 
-Puts Zigbee2MQTT's coordinator dongle on the network so it can sit in the best radio spot,
-away from the Home Assistant box. Custom ESP-IDF firmware with its own dashboard.
+Puts USB radio sticks (Zigbee, Thread, Z-Wave) on the network so they can sit in the best radio spot,
+away from the Home Assistant box. Custom ESP-IDF firmware with its own dashboard. Formerly **Zigbee
+Bridge**; the names kept for compatibility are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-One of three Zigbee apps with one look and one logo: **Zigbee Studio** ([zigbee-studio](https://github.com/home-controls/zigbee-studio), the
-Zigbee2MQTT UI add-on, which also shows this bridge), **Zigbee Sniffer** ([zigbee-sniffer](https://github.com/home-controls/zigbee-sniffer)) and this
-one. The dashboard is built on the shared **Zigbee UI** kit ([zigbee-ui](https://github.com/home-controls/zigbee-ui)), copied into
+Shares one look and one logo with two Zigbee apps: **Zigbee Studio** ([zigbee-studio](https://github.com/home-controls/zigbee-studio), the
+Zigbee2MQTT UI add-on, which also shows this bridge) and **Zigbee Sniffer** ([zigbee-sniffer](https://github.com/home-controls/zigbee-sniffer)).
+The dashboard is built on the shared **Zigbee UI** kit ([zigbee-ui](https://github.com/home-controls/zigbee-ui)), copied into
 `web/src/kit/`; don't edit it here (`npm run build` runs `node src/kit/check.mjs`, which fails on a
 hand-edited copy): change the kit, then `node <zigbee-ui>/tools/sync.mjs web/src/kit`. The firmware
 project and image are called `zigbee_eth_bridge`.
@@ -96,7 +97,7 @@ TXT record keeps `zigbee_port` and adds `ports` (every enabled radio's port, rad
 
 ## Build and flash
 
-No toolchain needed for a first flash: each [release](https://github.com/home-controls/zigbee-bridge/releases/latest)
+No toolchain needed for a first flash: each [release](https://github.com/home-controls/stick-bridge/releases/latest)
 has `zigbee_eth_bridge-<version>-full.bin` (bootloader, partition table and app in one file). With the board on
 its Type-C port:
 
@@ -127,13 +128,13 @@ Bump `version.txt` per release.
 ## Updates from git
 
 The bridge reads a release manifest (Settings → Updates; default: this repo's latest GitHub release,
-`https://github.com/home-controls/zigbee-bridge/releases/latest/download/manifest.json`) 15 s after boot
+`https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`) 15 s after boot
 and every 6 hours while automatic checks are on. A newer version shows an **Update** pill in the header and
 an **Install** button on System. Installing streams the image over HTTPS (CA bundle) into the spare OTA
 slot, hashing as it goes, and only marks it bootable when the image header is ours (chip, project, the
 version the manifest names) and the size, **MD5** and **SHA-256** all match the manifest, the image passes its
 own built-in hash, and an MD5 of what's actually in flash (read back) matches again. A server that drips or
-stalls is dropped (15 s per read, 5 minutes per download); redirects are followed (3 at most). Uploads and
+stalls is dropped (15 s per read, 5 minutes per download); redirects are followed (4 at most, https only). Uploads and
 git installs share one lock, so two can't write the spare slot at once.
 
 **Trial boot** (upload or git): the new firmware is kept once it has run 30 s with the network up and the
@@ -141,19 +142,12 @@ dashboard serving. A crash or watchdog before that, or no network/dashboard with
 back to the previous firmware by itself. The old firmware then says so (event log, System page) and warns
 before the same version is installed again.
 
-Release (bump `version.txt`, `npm run build` if the UI changed, `idf.py build`):
-
-```
-python tools/publish_release.py --notes "What changed" --github
-```
-
-It refuses test builds and an image whose version doesn't match `version.txt`, writes
-`zigbee_eth_bridge-<v>.bin`, its `.bin.md5` and `manifest.json` (in `release/<v>/`), plus the first-flash
-`zigbee_eth_bridge-<v>-full.bin` (esptool merge_bin of `build/flash_args`, so run it in ESP-IDF's environment)
-and `dongles.json` (`[]` unless that folder already has one), and makes them a GitHub release `v<v>` with
-the gh CLI. To serve updates from your own git server instead, give
-`--repo <checkout>` (files go to its `eth-bridge/`; `--commit --push`) and point Settings → Updates at that
-manifest. Rollback: an older image has to be uploaded on System (the bridge only offers versions newer
+Releases are cut by GitHub Actions from a tag on `main`: see [RELEASING.md](RELEASING.md).
+`tools/publish_release.py --assets-only` is the step CI runs to write the release files (`zigbee_eth_bridge-<v>.bin`,
+its `.bin.md5`, `manifest.json`, the first-flash `zigbee_eth_bridge-<v>-full.bin`, `dongles.json` and `SHA256SUMS`
+into `release/<v>/`). To serve updates from your own server instead, `--repo <checkout>` writes the image,
+MD5 and manifest into that git checkout's `eth-bridge/` (`--commit --push`); point Settings → Updates at
+its manifest. Rollback: an older image has to be uploaded on System (the bridge only offers versions newer
 than its own).
 
 ## Sticks the bridge knows (1.0.19)
