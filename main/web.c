@@ -1948,9 +1948,14 @@ bool web_running(void) { return s_web_running; }
 // esp_http_server reads a request's headers in one go on its only task, each recv waiting up to recv_wait_timeout:
 // a client sending a header byte every few seconds would hold every other page (and Zigbee Studio) for an hour.
 // Every socket is tracked from accept to close; one that has sat outside a handler for STALL_US (headers never
-// finished, or an idle keep-alive) is shut down from here, which ends the server's recv at once. close_fn takes
-// the same lock before closing, so a socket number is never shut down after it was handed to someone else.
+// finished, or an idle keep-alive) is first sent a FIN: a browser closes its end, the server's recv reads the end of
+// the stream and the session goes without a word in the log. One still there FIN_GRACE_US later is cut off with
+// SHUT_RDWR, which ends the server's recv at once (and the server logs "error in recv : 128" for it, rightly: that
+// client wouldn't let go). Every browser leaves a few idle keep-alives per visit, so cutting them all off filled the
+// log with that warning. close_fn takes the same lock before closing, so a socket number is never shut down after it
+// was handed to someone else.
 #define STALL_US (20 * 1000 * 1000LL)
+#define FIN_GRACE_US (5 * 1000 * 1000LL)
 #define MON_SLOTS CONFIG_LWIP_MAX_SOCKETS
 #define BUSY_CAP_US (30 * 1000 * 1000LL)        // a request in a handler: a slow reader can't hold the server longer
 #define BUSY_CAP_LONG_US (900 * 1000 * 1000LL)  // uploads, log downloads, formatting a card (mon_allow_long)
@@ -1960,7 +1965,8 @@ typedef struct {
     int64_t busy_us;  // when its current handler started
     bool busy;        // inside a handler
     bool long_ok;     // this handler may run up to BUSY_CAP_LONG_US
-    bool shut;
+    bool shut;        // cut off (SHUT_RDWR)
+    int64_t fin_us;   // when it was sent a FIN for sitting idle (0 = not yet)
 } mon_t;
 static mon_t s_mon[MON_SLOTS];
 static portMUX_TYPE s_mon_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -2041,11 +2047,20 @@ static void mon_task(void *arg) {
         for (int i = 0; i < MON_SLOTS; i++) {
             portENTER_CRITICAL(&s_mon_mux);
             mon_t m = s_mon[i];
-            bool stale = m.fd >= 0 && !m.shut &&
-                         (m.busy ? now - m.busy_us > (m.long_ok ? BUSY_CAP_LONG_US : BUSY_CAP_US) : now - m.last_us > STALL_US);
-            if (stale) s_mon[i].shut = true;
+            int how = -1;
+            if (m.fd >= 0 && !m.shut) {
+                if (m.busy) {  // a FIN would cut the handler's reply short: a handler past its cap is cut off outright
+                    if (now - m.busy_us > (m.long_ok ? BUSY_CAP_LONG_US : BUSY_CAP_US)) how = SHUT_RDWR;
+                } else if (m.fin_us) {
+                    if (now - m.fin_us > FIN_GRACE_US) how = SHUT_RDWR;
+                } else if (now - m.last_us > STALL_US) {
+                    how = SHUT_WR;
+                }
+                if (how == SHUT_RDWR) s_mon[i].shut = true;
+                if (how == SHUT_WR) s_mon[i].fin_us = now;
+            }
             portEXIT_CRITICAL(&s_mon_mux);
-            if (stale) shutdown(m.fd, SHUT_RDWR);  // the server sees the end and closes it (through mon_close)
+            if (how >= 0) shutdown(m.fd, how);  // the server sees the end and closes it (through mon_close)
         }
         xSemaphoreGive(s_mon_lock);
     }

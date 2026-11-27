@@ -2,6 +2,10 @@
 
 Each version's notes are what the bridge shows before installing it, so keep them under 500 bytes.
 
+## 2.1.2
+
+A quieter log: the web server closed each idle browser connection by cutting it off, and every cut logged "httpd_sock_err: error in recv : 128" (a few per dashboard visit). Idle connections now get a normal close first; only a client still holding on 5 s later is cut off, and only that one is logged.
+
 ## 2.1.1
 
 Updates from GitHub work every time: the bridge rebuilt each redirect without its query string, which drops the signature of GitHub's signed download address, so the download server sometimes answered "HTTP 618". Redirects now follow the server's address exactly. A bridge on 2.1.0 or earlier that shows HTTP 618: check again, or install this release's .bin on System, Firmware.
