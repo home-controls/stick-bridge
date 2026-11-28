@@ -4,7 +4,7 @@ Each version's notes are what the bridge shows before installing it, so keep the
 
 ## 2.2.0
 
-A bridge on a release candidate (GitHub pre-releases) is offered the final release. Bridges set up before the rename move their update source to the new address. The log no longer fills with "error in recv : 128" from closed browser connections. CH340/CH341 and FTDI baud rates rewritten: same at every standard rate; FTDI no longer gets divisors the chip lacks (above 1.5 Mbaud, below 184 baud).
+New on Settings, Updates: the release train. Stable, Release candidates (try each release first; the release follows) or Custom. Bridges set up before the rename move to the new update address. Quieter log: no more "error in recv : 128". CH340/CH341 and FTDI baud rates rewritten: same at every standard rate, and FTDI no longer gets divisors the chip lacks.
 
 ## 2.1.3
 

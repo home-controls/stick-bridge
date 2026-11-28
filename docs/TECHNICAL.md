@@ -127,8 +127,11 @@ Bump `version.txt` per release.
 
 ## Updates from git
 
-The bridge reads a release manifest (Settings → Updates; default: this repo's latest GitHub release,
-`https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`) 15 s after boot
+The bridge reads a release manifest chosen by the **release train** (Settings → Updates): **Stable** reads this
+repo's latest release; **Release candidates** reads the repo's 10 most recent releases from GitHub's API (a
+stream, `updtrain_core.c`) and takes the newest version with a `manifest.json`, pre-releases included;
+**Custom** reads the address you give. Default: Stable,
+`https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`. It checks 15 s after boot
 and every 6 hours while automatic checks are on. A newer version shows an **Update** pill in the header and
 an **Install** button on System. Installing streams the image over HTTPS (CA bundle) into the spare OTA
 slot, hashing as it goes, and only marks it bootable when the image header is ours (chip, project, the

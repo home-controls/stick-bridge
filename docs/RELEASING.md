@@ -68,15 +68,12 @@ publishes nothing.
 
 ## 4. Testing a release candidate
 
-On a test bridge, either:
-
-- **Upload it:** download `zigbee_eth_bridge-x.y.z-rcN.bin` from the pre-release and upload it on
-  **System → Firmware**; or
-- **Update to it:** set **Settings → Updates → source** to
-  `https://github.com/home-controls/stick-bridge/releases/download/vx.y.z-rcN/manifest.json` and install
-  from **System**. Afterwards set the source back to the default,
-  `https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`, or the bridge
-  keeps checking that one RC.
+On a test bridge, set **Settings → Updates → Release train** to **Release candidates**. The bridge then looks
+for the newest version among the repository's recent releases (pre-releases included) and offers it on
+**System** like any update: install it from there. When the release follows, it is offered on that train
+too; switch back to **Stable** whenever you like (the bridge keeps the candidate until a newer release
+comes). Or download `zigbee_eth_bridge-x.y.z-rcN.bin` from the pre-release and upload it on
+**System → Firmware**.
 
 The bridge keeps new firmware only if it starts properly (trial boot, see
 [TECHNICAL.md](TECHNICAL.md#updates-from-git)), and rolls back by itself otherwise. Use a throwaway

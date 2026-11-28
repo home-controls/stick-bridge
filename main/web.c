@@ -34,6 +34,7 @@
 #include "fwcheck.h"
 #include "fwcat.h"
 #include "sysinfo.h"
+#include "updtrain_core.h"
 #include "updater.h"
 #include "watchdog.h"
 
@@ -1169,6 +1170,7 @@ static cJSON *config_json(void) {
     cJSON_AddStringToObject(r, "role", role_key(c.role));
     cJSON_AddStringToObject(r, "update_url", c.update_url);
     cJSON_AddBoolToObject(r, "update_auto", c.update_auto);
+    cJSON_AddStringToObject(r, "update_train", ut_name((ut_train_t)c.update_train));
     cJSON_AddBoolToObject(r, "usb_fs_only", c.usb_fs_only);
     // Every radio's link; radio 0's port/host/baud/role are the flat fields above (either may be posted). shown:
     // the dashboard edits those; gen: post it back, so an edit made before a stick took or left the radio is refused.
@@ -1263,6 +1265,11 @@ static esp_err_t h_config_post(httpd_req_t *req) {
     if (!bad && (v = cJSON_GetObjectItem(j, "update_auto"))) {
         if (!cJSON_IsBool(v)) bad = "update_auto is true or false";
         else c.update_auto = cJSON_IsTrue(v);
+    }
+    if (!bad && (v = cJSON_GetObjectItem(j, "update_train"))) {
+        int t = cJSON_IsString(v) ? ut_parse(v->valuestring) : -1;
+        if (t < 0) bad = "Update train: stable, rc or custom";
+        else c.update_train = (uint8_t)t;
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "baud"))) {
         if (!cJSON_IsNumber(v) || v->valuedouble < 9600 || v->valuedouble > 921600) bad = "Baud rate must be 9600-921600";
