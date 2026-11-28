@@ -359,16 +359,18 @@ static esp_err_t deny(httpd_req_t *req) {
     do {                                                                                   \
         auth_kind_t _k = auth_kind(req);                                                   \
         if (_k == AUTH_NONE) return deny(req);                                             \
-        if (_k == AUTH_SESSION && !csrf_ok(req))                                           \
+        if (_k != AUTH_TOKEN && !csrf_ok(req))                                             \
             return send_error(req, "403 Forbidden", "missing X-Bridge");                   \
     } while (0)
+// Every change but the API token's needs X-Bridge: 1, Basic as much as a session (a browser can send cached Basic
+// credentials with a cross-site form; a custom header it can't).
 // Password and token management need the dashboard (a logged-in browser), not the API token.
 #define REQUIRE_SESSION(req)                                                               \
     do {                                                                                   \
         auth_kind_t _k = auth_kind(req);                                                   \
         if (_k == AUTH_NONE) return deny(req);                                             \
         if (_k == AUTH_TOKEN) return send_error(req, "403 Forbidden", "not with the API token"); \
-        if (_k == AUTH_SESSION && !csrf_ok(req))                                           \
+        if (!csrf_ok(req))                                                                 \
             return send_error(req, "403 Forbidden", "missing X-Bridge");                   \
     } while (0)
 
@@ -644,6 +646,7 @@ static esp_err_t h_login(httpd_req_t *req) {
 }
 
 static esp_err_t h_logout(httpd_req_t *req) {
+    if (!csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");  // no logging out from other sites
     char tok[48];
     size_t tl = sizeof(tok);
     if (httpd_req_get_cookie_val(req, "zb_session", tok, &tl) == ESP_OK) session_ok(tok, true);
@@ -1210,7 +1213,7 @@ static bool get_ip(const cJSON *j, const char *k, uint32_t *out) {
 static esp_err_t h_config_post(httpd_req_t *req) {
     auth_kind_t kind = auth_kind(req);
     if (kind == AUTH_NONE) return deny(req);
-    if (kind == AUTH_SESSION && !csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");
+    if (kind != AUTH_TOKEN && !csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");
     cJSON *j = read_json(req);
     if (!j) return send_error(req, "400 Bad Request", "bad JSON");
     // The API token (Zigbee Studio) only moves radio 1's allowed host, never to "anyone": update sources, the network
@@ -1846,8 +1849,9 @@ static esp_err_t h_dongle_flash(httpd_req_t *req) {
 
 static esp_err_t h_metrics(httpd_req_t *req) {
     if (!authed(req)) {
+        // No Basic challenge: a browser would cache the password for the whole bridge and send it along with
+        // cross-site requests. Prometheus and curl -u send Basic credentials without being asked.
         httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"zigbee-eth-bridge\"");
         return httpd_resp_sendstr(req, "login required\n");
     }
     bridge_stats_t g;

@@ -55,7 +55,7 @@ Zigbee2MQTT runs on. Zigbee2MQTT then uses (with your bridge's address):
 
 ## API (for Zigbee Studio and scripts)
 
-Auth: browser session cookie (+ `X-Bridge: 1` on changes), `Authorization: Bearer <token>` (create it under
+Auth: browser session cookie or Basic (both need `X-Bridge: 1` on changes), `Authorization: Bearer <token>` (create it under
 Settings → API access; shown once), or Basic `admin:<password>`. The token can read everything, reboot, reset the
 counters, check for updates and set radio 1's allowed host (`POST /api/config {"allow": "..."}`: one address or a range of /8 or narrower, never anyone). Everything
 else that changes the bridge (other settings, installing firmware, flashing sticks, the password, the token) needs the
@@ -88,7 +88,7 @@ dashboard or Basic. mDNS: `zigbee-eth-bridge.local`, service `_zbbridge._tcp`
 | POST | `/api/dongle/flash` `{md5}` | session only; `md5` must be the stored image's; 409 + why when it can't start |
 | GET | `/api/dongles` | the dongles the bridge recognises (USB ID, chip, radio, protocol, bootloader entry, flashable) |
 | POST | `/api/dongle/firmware/check`, `/api/dongle/firmware/download` `{name}` | session only; GitHub firmware check / download into the image area; state in `GET /api/dongle` → `catalog` |
-| GET | `/metrics` | Prometheus (Basic auth is checked with PBKDF2 once, then the header is remembered for 10 min until the password changes); 1.0.23 adds `zbbridge_radio_*{radio="1".."3"}` (stick/client connected, bytes each way, client drops) |
+| GET | `/metrics` | Prometheus (send Basic credentials up front: no browser login prompt; Basic auth is checked with PBKDF2 once, then the header is remembered for 10 min until the password changes); 1.0.23 adds `zbbridge_radio_*{radio="1".."3"}` (stick/client connected, bytes each way, client drops) |
 
 `/api/status` keeps every field it had (radio 0 = the dongle) and adds `radios`: one entry per radio with its link
 (`enabled`, `name`, `role`, `tcp_port`, `allowed`, `baud`), `stick` (present, open, USB ID, serial, model, protocol,
