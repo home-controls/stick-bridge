@@ -13,7 +13,9 @@ export type Extra = { name: string; values: (number | null)[]; format?: (v: numb
 
 const M = { l: 44, r: 14, t: 10, b: 22 };
 
-export function useWidth(): [preact.RefObject<HTMLDivElement>, number] {
+// The ref's type is whatever useRef gives (RefObject<T> in preact 10, RefObject<T | null> in 11), so the hook works
+// with both and a <div ref={ref}> accepts it in each.
+export function useWidth() {
   const ref = useRef<HTMLDivElement>(null);
   const [w, setW] = useState(600);
   useEffect(() => {
@@ -24,7 +26,7 @@ export function useWidth(): [preact.RefObject<HTMLDivElement>, number] {
     setW(Math.max(240, el.clientWidth));
     return () => ro.disconnect();
   }, []);
-  return [ref, w];
+  return [ref, w] as const;
 }
 
 /** Clean ticks: 3–5 round numbers covering [lo, hi]. */

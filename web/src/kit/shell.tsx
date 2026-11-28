@@ -16,7 +16,7 @@ export type AppId = "studio" | "sniffer" | "bridge";
 export const APPS: Record<AppId, { name: string; blurb: string }> = {
   studio: { name: "Zigbee Studio", blurb: "Devices, groups and settings for Zigbee2MQTT" },
   sniffer: { name: "Zigbee Sniffer", blurb: "What the radios hear: signal, routes, the mesh" },
-  bridge: { name: "Zigbee Bridge", blurb: "The coordinator on Ethernet" },
+  bridge: { name: "Stick Bridge", blurb: "Radio sticks on Ethernet" },
 };
 
 export interface NavItem {
@@ -98,7 +98,10 @@ export function Brand({ app, version, links = {} }: { app: AppId; version?: stri
       {open && (
         <div class="apps-menu" role="menu">
           {(Object.keys(APPS) as AppId[]).filter((a) => a === app || links[a]).map((a) => (
-            <a role="menuitem" class={a === app ? "current" : ""} href={a === app ? href() : links[a]} target={a === app ? undefined : "_top"}
+            <a role="menuitem" class={a === app ? "current" : ""} href={a === app ? href() : links[a]}
+              // another page of Home Assistant replaces this one; another machine (the bridge) opens beside it
+              target={a === app ? undefined : /^https?:/.test(links[a] || "") ? "_blank" : "_top"}
+              rel={/^https?:/.test(links[a] || "") ? "noopener" : undefined}
               onClick={() => setOpen(false)}>
               <Logo size={28} />
               <b>{APPS[a].name}{a === app && version ? <span class="brand-ver"> {version}</span> : null}</b>

@@ -327,6 +327,7 @@ table.devices { width: 100%; border-collapse: collapse; }
   width: min(480px, 100%); background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
   box-shadow: 0 24px 60px rgb(0 0 0 / 0.4); padding: 20px; display: flex; flex-direction: column; gap: 12px; margin-top: 6vh;
 }
+.dialog-form { display: contents; }
 .dialog h2 { display: flex; align-items: center; gap: 8px; font-size: 18px; }
 .dialog h2 .icon { color: var(--bad); }
 .dialog-body { color: var(--muted); }
