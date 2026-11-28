@@ -34,6 +34,7 @@
 #include "fwcheck.h"
 #include "fwcat.h"
 #include "sysinfo.h"
+#include "updtrain_core.h"
 #include "updater.h"
 #include "watchdog.h"
 
@@ -1169,6 +1170,7 @@ static cJSON *config_json(void) {
     cJSON_AddStringToObject(r, "role", role_key(c.role));
     cJSON_AddStringToObject(r, "update_url", c.update_url);
     cJSON_AddBoolToObject(r, "update_auto", c.update_auto);
+    cJSON_AddStringToObject(r, "update_train", ut_name((ut_train_t)c.update_train));
     cJSON_AddBoolToObject(r, "usb_fs_only", c.usb_fs_only);
     // Every radio's link; radio 0's port/host/baud/role are the flat fields above (either may be posted). shown:
     // the dashboard edits those; gen: post it back, so an edit made before a stick took or left the radio is refused.
@@ -1263,6 +1265,11 @@ static esp_err_t h_config_post(httpd_req_t *req) {
     if (!bad && (v = cJSON_GetObjectItem(j, "update_auto"))) {
         if (!cJSON_IsBool(v)) bad = "update_auto is true or false";
         else c.update_auto = cJSON_IsTrue(v);
+    }
+    if (!bad && (v = cJSON_GetObjectItem(j, "update_train"))) {
+        int t = cJSON_IsString(v) ? ut_parse(v->valuestring) : -1;
+        if (t < 0) bad = "Update train: stable, rc or custom";
+        else c.update_train = (uint8_t)t;
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "baud"))) {
         if (!cJSON_IsNumber(v) || v->valuedouble < 9600 || v->valuedouble > 921600) bad = "Baud rate must be 9600-921600";
@@ -1953,11 +1960,12 @@ bool web_running(void) { return s_web_running; }
 // a client sending a header byte every few seconds would hold every other page (and Zigbee Studio) for an hour.
 // Every socket is tracked from accept to close; one that has sat outside a handler for STALL_US (headers never
 // finished, or an idle keep-alive) is first sent a FIN: a browser closes its end, the server's recv reads the end of
-// the stream and the session goes without a word in the log. One still there FIN_GRACE_US later is cut off with
-// SHUT_RDWR, which ends the server's recv at once (and the server logs "error in recv : 128" for it, rightly: that
-// client wouldn't let go). Every browser leaves a few idle keep-alives per visit, so cutting them all off filled the
-// log with that warning. close_fn takes the same lock before closing, so a socket number is never shut down after it
-// was handed to someone else.
+// the stream and the session goes. One still there FIN_GRACE_US later is cut off with SHUT_RDWR, which ends the
+// server's recv at once. Browsers often notice a FIN only when they next look at the socket, so a page's idle
+// keep-alives regularly reach that cut, and esp_http_server warns "httpd_sock_err: error in recv : 128" for each:
+// a few per visit, all routine. Its httpd_txrx tag is therefore kept to errors (web_start); a request cut off
+// inside a handler, the case that matters, gets a warning of our own. close_fn takes the same lock before closing,
+// so a socket number is never shut down after it was handed to someone else.
 #define STALL_US (20 * 1000 * 1000LL)
 #define FIN_GRACE_US (5 * 1000 * 1000LL)
 #define MON_SLOTS CONFIG_LWIP_MAX_SOCKETS
@@ -2065,6 +2073,9 @@ static void mon_task(void *arg) {
             }
             portEXIT_CRITICAL(&s_mon_mux);
             if (how >= 0) shutdown(m.fd, how);  // the server sees the end and closes it (through mon_close)
+            if (how == SHUT_RDWR && m.busy)
+                ESP_LOGW(TAG, "Cut off a request still running after %lld s (a client that stopped reading or sending)",
+                         (long long)((now - m.busy_us) / 1000000));
         }
         xSemaphoreGive(s_mon_lock);
     }
@@ -2084,6 +2095,9 @@ void web_start(void) {
     cfg.send_wait_timeout = 10;
     cfg.open_fn = mon_open;
     cfg.close_fn = mon_close;
+    // esp_http_server warns about every socket a client drops or the stall monitor cuts ("httpd_sock_err: error in
+    // recv : 128"): routine for a web server, noise in the bridge's log. Its real errors still show.
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
     httpd_handle_t srv;
     if (httpd_start(&srv, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server failed to start");

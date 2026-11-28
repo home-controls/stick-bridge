@@ -127,8 +127,11 @@ Bump `version.txt` per release.
 
 ## Updates from git
 
-The bridge reads a release manifest (Settings → Updates; default: this repo's latest GitHub release,
-`https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`) 15 s after boot
+The bridge reads a release manifest chosen by the **release train** (Settings → Updates): **Stable** reads this
+repo's latest release; **Release candidates** reads the repo's 10 most recent releases from GitHub's API (a
+stream, `updtrain_core.c`) and takes the newest version with a `manifest.json`, pre-releases included;
+**Custom** reads the address you give. Default: Stable,
+`https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`. It checks 15 s after boot
 and every 6 hours while automatic checks are on. A newer version shows an **Update** pill in the header and
 an **Install** button on System. Installing streams the image over HTTPS (CA bundle) into the spare OTA
 slot, hashing as it goes, and only marks it bootable when the image header is ours (chip, project, the
@@ -142,8 +145,9 @@ dashboard serving. A crash or watchdog before that, or no network/dashboard with
 back to the previous firmware by itself. The old firmware then says so (event log, System page) and warns
 before the same version is installed again.
 
-Releases are cut by GitHub Actions from a tag on `main`: see [RELEASING.md](RELEASING.md). Versions are `x.y.z`
-or `x.y.z-rcN` (release candidates, published as GitHub pre-releases, which `releases/latest` never serves);
+Releases are cut by GitHub Actions from a tag on `main`: see [RELEASING.md](RELEASING.md). `version.txt` holds the
+version being prepared (`x.y.z`); a `vx.y.z-rcN` tag builds that commit as a release candidate (published as a
+GitHub pre-release, which `releases/latest` never serves) and `vx.y.z` as the release;
 `main/version_core.c` orders them, an RC below its release, so a bridge on an RC is offered the release.
 `tools/publish_release.py --assets-only` is the step CI runs to write the release files (`zigbee_eth_bridge-<v>.bin`,
 its `.bin.md5`, `manifest.json`, the first-flash `zigbee_eth_bridge-<v>-full.bin`, `dongles.json` and `SHA256SUMS`

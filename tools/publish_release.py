@@ -67,6 +67,8 @@ def main() -> None:
                    "else ZIGBEE_OTA, else ../zigbee-ota next to this repo")
     p.add_argument("--github", action="store_true", help="publish as a GitHub release of this repo instead (gh CLI): "
                    "the bridge's default update URL is releases/latest/download/manifest.json")
+    p.add_argument("--version", help="the version the image must say (default: version.txt; CI passes a release "
+                   "candidate's x.y.z-rcN, built with -DBRIDGE_VER)")
     p.add_argument("--assets-only", action="store_true", help="write release/<version>/ (as --github would) and publish nothing")
     p.add_argument("--commit", action="store_true", help="git add + commit in the repo")
     p.add_argument("--push", action="store_true", help="git push after committing")
@@ -80,13 +82,13 @@ def main() -> None:
     if len(a.notes.strip().encode()) > 500:
         sys.exit("keep --notes under 500 bytes: the bridge shows (and keeps) only that much")
 
-    want = (HERE / "version.txt").read_text().strip()
+    want = a.version or (HERE / "version.txt").read_text().strip()
     data = IMAGE.read_bytes()
     version, project = image_info(data)
     if project != "zigbee_eth_bridge":
         sys.exit(f"the image is {project!r}, not zigbee_eth_bridge")
     if version != want:
-        sys.exit(f"the image says {version}, version.txt says {want}: build again")
+        sys.exit(f"the image says {version}, expected {want}: build again")
     if not re.match(r"^\d+\.\d+\.\d+(-rc[1-9]\d*)?$", version):
         sys.exit(f"{version} is a test build: releases are x.y.z, or x.y.z-rcN for a release candidate")
 

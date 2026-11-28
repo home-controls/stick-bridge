@@ -64,8 +64,12 @@ menu "Zigbee Ethernet bridge"
         default "Koenkk/Z-Stack-firmware"
 
     config BRIDGE_DEFAULT_UPDATE_URL
-        string "Release manifest on git (updates)"
+        string "Release manifest on git (updates): the stable train"
         default "https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json"
+
+    config BRIDGE_UPDATE_REPO
+        string "GitHub repo (owner/name) whose releases the release-candidate train reads"
+        default "home-controls/stick-bridge"
 
     config BRIDGE_TEST_HOOKS
         bool "Test hooks (POST /api/debug/watchdog): never in a release"
