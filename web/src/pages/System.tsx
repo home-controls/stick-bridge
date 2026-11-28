@@ -3,13 +3,15 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { api, atUptime, awaitReboot, bootEpoch, logText, pollLog, post, radioAt, resetEvents, status, toast, usePoll } from "../store";
 import { bytes, clock, duration, num } from "../format";
-import type { DongleFw, DongleModel, FwCatalog, UpdateState } from "../types";
+import type { DongleFw, DongleModel, FwCatalog, UpdateState, UpdateTrain } from "../types";
 import { Card, Empty, KV, Seg, Stat } from "../ui";
 import { LogStorage, StoredLog } from "./LogStore";
 import { Icon } from "../icons";
 import { confirmIt } from "../dialog";
 import { rebootNow } from "../App";
 import { UsbCard, cap, clientOf, stickName } from "./Radios";
+
+const TRAIN_NAME: Record<UpdateTrain, string> = { stable: "stable", rc: "release-candidate", custom: "custom" };
 
 // ESP-IDF log lines: "I (1234) tag: message", the number being ms since boot
 const LINE = /^([EWIDV]) \((\d+)\) ([^:]+): (.*)$/;
@@ -136,15 +138,15 @@ function Updates() {
   const checked = u.checked_ago >= 0 ? `checked ${duration(u.checked_ago)} ago` : "not checked yet";
   return (
     <Card title={<><Icon name="refresh" size={18} /> Updates</>} class="span-all"
-      actions={<span class="muted small">{u.auto ? "checks git every 6 h" : "automatic checks off"} · {checked}</span>}>
+      actions={<span class="muted small">{TRAIN_NAME[u.train ?? "stable"]} train · {u.auto ? "checks every 6 h" : "automatic checks off"} · {checked}</span>}>
       <div class="update-row">
         <div class="update-main">
           {u.state === "available" && <>
-            <div class="update-head"><span class="chip warn">New</span> <b>Firmware {u.latest}</b> is available{u.date ? ` (${u.date})` : ""} · you have {u.current}</div>
+            <div class="update-head"><span class="chip warn">New</span> <b>Firmware {u.latest}</b> is available{u.latest_prerelease ? " as a release candidate" : ""}{u.date ? ` (${u.date})` : ""} · you have {u.current}</div>
             {u.notes && <p class="update-notes">{u.notes}</p>}
           </>}
           {u.rolled_back && <div class="update-head bad-text"><Icon name="alert" size={16} /> Firmware {u.rolled_back} didn't start properly, so the bridge went back to {u.current}.</div>}
-          {u.state === "uptodate" && <div class="update-head"><span class="ok-text"><Icon name="check" size={16} /> Up to date</span> <span class="muted">· {u.current} is the latest release</span></div>}
+          {u.state === "uptodate" && <div class="update-head"><span class="ok-text"><Icon name="check" size={16} /> Up to date</span> <span class="muted">· nothing newer than {u.current} on the {TRAIN_NAME[u.train ?? "stable"]} train</span></div>}
           {u.state === "idle" && <div class="update-head muted">Not checked yet. You run {u.current}.</div>}
           {u.state === "checking" && <div class="update-head muted">Checking git…</div>}
           {u.state === "downloading" && <>

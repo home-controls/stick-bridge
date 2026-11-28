@@ -44,7 +44,7 @@ licence comments, so they are listed here.
 
 | Package | Version | Licence | Copyright |
 | --- | --- | --- | --- |
-| preact | 10.29.8 | MIT | Copyright (c) 2015-present Jason Miller |
+| preact | 11.2.0 | MIT | Copyright (c) 2015-present Jason Miller |
 | @preact/signals | 2.11.4 | MIT | Copyright (c) 2022-present Preact Team |
 | @preact/signals-core | 1.14.5 | MIT | Copyright (c) 2022-present Preact Team |
 
@@ -63,7 +63,7 @@ follows one of the BSD-licensed projects, that project's notice is reproduced at
 - [Z-Stack-firmware](https://github.com/Koenkk/Z-Stack-firmware) (MIT) and [silabs-firmware-builder](https://github.com/NabuCasa/silabs-firmware-builder): the firmware catalogues the bridge reads at run time
 - [universal-silabs-flasher](https://github.com/NabuCasa/universal-silabs-flasher): bootloader entry timings for some Silicon Labs sticks
 - Nordic Semiconductor's nRF5 SDK documentation: the Secure DFU serial protocol (`main/nrfdfu_core.c`)
-- The Linux kernel's USB serial drivers and the chip makers' datasheets: USB serial adapter requests (`main/usbser_core.c`)
+- The chip makers' documents (WCH CH340/CH341, FTDI AN232B-05, Silicon Labs AN571): USB serial adapter requests (`main/usbser.c`). The CH340/CH341 and FTDI baud-rate code (`main/serial_baud.c`) was implemented clean-room, from [docs/usb-serial-baud.md](docs/usb-serial-baud.md) alone, without access to the previous code or any other driver's source
 
 ## Notices required by BSD-3-Clause
 

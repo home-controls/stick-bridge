@@ -76,7 +76,7 @@ export function Icon({ name, size = 20, class: cls, title }: { name: IconName | 
   );
 }
 
-/** The shared logo (the user's licensed Zigbee mark), the same in every app. */
+/** The shared logo (the Zigbee mark), the same in every app. */
 export function Logo({ size = 24, title }: { size?: number; title?: string }): JSX.Element {
   return <img class="logo" src={LOGO_PNG} width={size} height={size} alt={title ?? ""} aria-hidden={title ? undefined : "true"} draggable={false} />;
 }

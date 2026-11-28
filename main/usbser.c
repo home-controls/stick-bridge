@@ -1,4 +1,5 @@
 #include "usbser.h"
+#include "serial_baud.h"
 
 #include <string.h>
 
@@ -46,7 +47,7 @@ static esp_err_t cp_baud(us_port_t *p, uint32_t baud) {
     return req(p, CP_OUT, CP_SET_BAUDRATE, 0, 0, 4, b);
 }
 
-// ---------------------------------------------------------------- CH340/CH341 (Linux ch341.c; device requests)
+// ---------------------------------------------------------------- CH340/CH341 (WCH vendor requests)
 #define CH_OUT 0x40
 #define CH_IN 0xC0
 #define CH_READ_VERSION 0x5F
@@ -58,14 +59,14 @@ static esp_err_t cp_baud(us_port_t *p, uint32_t baud) {
 #define CH_RTS 0x40
 
 static esp_err_t ch_baud(us_port_t *p, uint32_t baud) {
-    int w = us_ch34x_divisor(baud, p->ch34x_version);
+    int w = sb_ch34x_word(baud, p->ch34x_version);
     if (w < 0) return ESP_ERR_INVALID_ARG;
     esp_err_t e = req(p, CH_OUT, CH_WRITE_REG, 0x1312, (uint16_t)w, 0, NULL);
     if (e != ESP_OK || p->ch34x_version < 0x30) return e;
     return req(p, CH_OUT, CH_WRITE_REG, 0x2518, 0xC3, 0, NULL);  // LCR: RX+TX on, 8 bits, no parity, 1 stop
 }
 
-// ---------------------------------------------------------------- FTDI (Linux ftdi_sio.c; device requests, port 0)
+// ---------------------------------------------------------------- FTDI (vendor requests, port 0; FTDI AN232B-05 for the rate)
 #define FT_OUT 0x40
 #define FT_IN 0xC0
 #define FT_RESET 0x00
@@ -76,7 +77,7 @@ static esp_err_t ch_baud(us_port_t *p, uint32_t baud) {
 #define FT_LATENCY 0x09
 
 static esp_err_t ft_baud(us_port_t *p, uint32_t baud) {
-    uint32_t d = us_ftdi_divisor(baud);
+    uint32_t d = sb_ftdi_value(baud);
     return req(p, FT_OUT, FT_SET_BAUD, (uint16_t)d, (uint16_t)(d >> 16), 0, NULL);
 }
 
@@ -248,7 +249,7 @@ esp_err_t us_get_comm(us_port_t *p, us_comm_t *c) {
 
 esp_err_t us_set_gpio(us_port_t *p, uint8_t mask, uint8_t state) {
     if (p->chip != US_CP210X) return ESP_ERR_NOT_SUPPORTED;
-    // Linux cp210x_gpio_set for CP2102N: vendor request to the device, wIndex = state << 8 | mask
+    // CP2102N GPIO latch write (Silicon Labs AN571): vendor request to the device, wIndex = state << 8 | mask
     return req(p, 0x40, CP_VENDOR, CP_WRITE_LATCH, (uint16_t)(state << 8 | mask), 0, NULL);
 }
 

@@ -1,4 +1,5 @@
 #include "fwcheck.h"
+#include "version_core.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -28,25 +29,7 @@ const char *fw_check_header(const uint8_t *buf, size_t len, char *ver_out) {
     return NULL;
 }
 
-static void parse(const char *s, long out[3]) {
-    out[0] = out[1] = out[2] = 0;
-    for (int i = 0; i < 3 && s && *s && *s != '+' && *s != '-'; i++) {
-        char *end;
-        out[i] = strtol(s, &end, 10);
-        s = *end == '.' ? end + 1 : end;
-        if (*end != '.') break;
-    }
-}
-
-int fw_version_cmp(const char *a, const char *b) {
-    long x[3], y[3];
-    parse(a, x);
-    parse(b, y);
-    for (int i = 0; i < 3; i++) {
-        if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
-    }
-    return 0;
-}
+int fw_version_cmp(const char *a, const char *b) { return ver_cmp(a, b); }  // version_core.c: RCs below releases
 
 static portMUX_TYPE s_write_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_writing;

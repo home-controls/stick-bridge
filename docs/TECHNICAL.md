@@ -55,7 +55,7 @@ Zigbee2MQTT runs on. Zigbee2MQTT then uses (with your bridge's address):
 
 ## API (for Zigbee Studio and scripts)
 
-Auth: browser session cookie (+ `X-Bridge: 1` on changes), `Authorization: Bearer <token>` (create it under
+Auth: browser session cookie or Basic (both need `X-Bridge: 1` on changes), `Authorization: Bearer <token>` (create it under
 Settings → API access; shown once), or Basic `admin:<password>`. The token can read everything, reboot, reset the
 counters, check for updates and set radio 1's allowed host (`POST /api/config {"allow": "..."}`: one address or a range of /8 or narrower, never anyone). Everything
 else that changes the bridge (other settings, installing firmware, flashing sticks, the password, the token) needs the
@@ -88,7 +88,7 @@ dashboard or Basic. mDNS: `zigbee-eth-bridge.local`, service `_zbbridge._tcp`
 | POST | `/api/dongle/flash` `{md5}` | session only; `md5` must be the stored image's; 409 + why when it can't start |
 | GET | `/api/dongles` | the dongles the bridge recognises (USB ID, chip, radio, protocol, bootloader entry, flashable) |
 | POST | `/api/dongle/firmware/check`, `/api/dongle/firmware/download` `{name}` | session only; GitHub firmware check / download into the image area; state in `GET /api/dongle` → `catalog` |
-| GET | `/metrics` | Prometheus (Basic auth is checked with PBKDF2 once, then the header is remembered for 10 min until the password changes); 1.0.23 adds `zbbridge_radio_*{radio="1".."3"}` (stick/client connected, bytes each way, client drops) |
+| GET | `/metrics` | Prometheus (send Basic credentials up front: no browser login prompt; Basic auth is checked with PBKDF2 once, then the header is remembered for 10 min until the password changes); 1.0.23 adds `zbbridge_radio_*{radio="1".."3"}` (stick/client connected, bytes each way, client drops) |
 
 `/api/status` keeps every field it had (radio 0 = the dongle) and adds `radios`: one entry per radio with its link
 (`enabled`, `name`, `role`, `tcp_port`, `allowed`, `baud`), `stick` (present, open, USB ID, serial, model, protocol,
@@ -127,8 +127,11 @@ Bump `version.txt` per release.
 
 ## Updates from git
 
-The bridge reads a release manifest (Settings → Updates; default: this repo's latest GitHub release,
-`https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`) 15 s after boot
+The bridge reads a release manifest chosen by the **release train** (Settings → Updates): **Stable** reads this
+repo's latest release; **Release candidates** reads the repo's 10 most recent releases from GitHub's API (a
+stream, `updtrain_core.c`) and takes the newest version with a `manifest.json`, pre-releases included;
+**Custom** reads the address you give. Default: Stable,
+`https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json`. It checks 15 s after boot
 and every 6 hours while automatic checks are on. A newer version shows an **Update** pill in the header and
 an **Install** button on System. Installing streams the image over HTTPS (CA bundle) into the spare OTA
 slot, hashing as it goes, and only marks it bootable when the image header is ours (chip, project, the
@@ -142,7 +145,10 @@ dashboard serving. A crash or watchdog before that, or no network/dashboard with
 back to the previous firmware by itself. The old firmware then says so (event log, System page) and warns
 before the same version is installed again.
 
-Releases are cut by GitHub Actions from a tag on `main`: see [RELEASING.md](RELEASING.md).
+Releases are cut by GitHub Actions from a tag on `main`: see [RELEASING.md](RELEASING.md). `version.txt` holds the
+version being prepared (`x.y.z`); a `vx.y.z-rcN` tag builds that commit as a release candidate (published as a
+GitHub pre-release, which `releases/latest` never serves) and `vx.y.z` as the release;
+`main/version_core.c` orders them, an RC below its release, so a bridge on an RC is offered the release.
 `tools/publish_release.py --assets-only` is the step CI runs to write the release files (`zigbee_eth_bridge-<v>.bin`,
 its `.bin.md5`, `manifest.json`, the first-flash `zigbee_eth_bridge-<v>-full.bin`, `dongles.json` and `SHA256SUMS`
 into `release/<v>/`). To serve updates from your own server instead, `--repo <checkout>` writes the image,

@@ -88,7 +88,7 @@ typedef struct {
 static esp_err_t on_http_event(esp_http_client_event_t *e) {
     location_t *l = e->user_data;
     if (l && e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && e->header_value && strcasecmp(e->header_key, "Location") == 0)
-        strlcpy(l->buf, e->header_value, l->cap);
+        if (strlcpy(l->buf, e->header_value, l->cap) >= l->cap) l->buf[0] = 0;  // cut off = no usable redirect
     return ESP_OK;
 }
 
@@ -148,6 +148,9 @@ static esp_http_client_handle_t gh_open(const char *url, bool api, int *status, 
             bool redirect = *status == 301 || *status == 302 || *status == 303 || *status == 307 || *status == 308;
             if (*status == 0 || *len < -1) *why = "no answer";
             else if (!redirect) {
+                // the caller reads the body with this client: the handler must not keep pointing at loc, whose buffer
+                // is freed below (chunked trailers go through the header callback too)
+                esp_http_client_set_user_data(c, NULL);
                 ret = c;
                 break;
             } else if (hop >= 4) *why = "too many redirects";

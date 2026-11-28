@@ -34,6 +34,7 @@
 #include "fwcheck.h"
 #include "fwcat.h"
 #include "sysinfo.h"
+#include "updtrain_core.h"
 #include "updater.h"
 #include "watchdog.h"
 
@@ -359,16 +360,18 @@ static esp_err_t deny(httpd_req_t *req) {
     do {                                                                                   \
         auth_kind_t _k = auth_kind(req);                                                   \
         if (_k == AUTH_NONE) return deny(req);                                             \
-        if (_k == AUTH_SESSION && !csrf_ok(req))                                           \
+        if (_k != AUTH_TOKEN && !csrf_ok(req))                                             \
             return send_error(req, "403 Forbidden", "missing X-Bridge");                   \
     } while (0)
+// Every change but the API token's needs X-Bridge: 1, Basic as much as a session (a browser can send cached Basic
+// credentials with a cross-site form; a custom header it can't).
 // Password and token management need the dashboard (a logged-in browser), not the API token.
 #define REQUIRE_SESSION(req)                                                               \
     do {                                                                                   \
         auth_kind_t _k = auth_kind(req);                                                   \
         if (_k == AUTH_NONE) return deny(req);                                             \
         if (_k == AUTH_TOKEN) return send_error(req, "403 Forbidden", "not with the API token"); \
-        if (_k == AUTH_SESSION && !csrf_ok(req))                                           \
+        if (!csrf_ok(req))                                                                 \
             return send_error(req, "403 Forbidden", "missing X-Bridge");                   \
     } while (0)
 
@@ -644,6 +647,7 @@ static esp_err_t h_login(httpd_req_t *req) {
 }
 
 static esp_err_t h_logout(httpd_req_t *req) {
+    if (!csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");  // no logging out from other sites
     char tok[48];
     size_t tl = sizeof(tok);
     if (httpd_req_get_cookie_val(req, "zb_session", tok, &tl) == ESP_OK) session_ok(tok, true);
@@ -1166,6 +1170,7 @@ static cJSON *config_json(void) {
     cJSON_AddStringToObject(r, "role", role_key(c.role));
     cJSON_AddStringToObject(r, "update_url", c.update_url);
     cJSON_AddBoolToObject(r, "update_auto", c.update_auto);
+    cJSON_AddStringToObject(r, "update_train", ut_name((ut_train_t)c.update_train));
     cJSON_AddBoolToObject(r, "usb_fs_only", c.usb_fs_only);
     // Every radio's link; radio 0's port/host/baud/role are the flat fields above (either may be posted). shown:
     // the dashboard edits those; gen: post it back, so an edit made before a stick took or left the radio is refused.
@@ -1210,7 +1215,7 @@ static bool get_ip(const cJSON *j, const char *k, uint32_t *out) {
 static esp_err_t h_config_post(httpd_req_t *req) {
     auth_kind_t kind = auth_kind(req);
     if (kind == AUTH_NONE) return deny(req);
-    if (kind == AUTH_SESSION && !csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");
+    if (kind != AUTH_TOKEN && !csrf_ok(req)) return send_error(req, "403 Forbidden", "missing X-Bridge");
     cJSON *j = read_json(req);
     if (!j) return send_error(req, "400 Bad Request", "bad JSON");
     // The API token (Zigbee Studio) only moves radio 1's allowed host, never to "anyone": update sources, the network
@@ -1260,6 +1265,11 @@ static esp_err_t h_config_post(httpd_req_t *req) {
     if (!bad && (v = cJSON_GetObjectItem(j, "update_auto"))) {
         if (!cJSON_IsBool(v)) bad = "update_auto is true or false";
         else c.update_auto = cJSON_IsTrue(v);
+    }
+    if (!bad && (v = cJSON_GetObjectItem(j, "update_train"))) {
+        int t = cJSON_IsString(v) ? ut_parse(v->valuestring) : -1;
+        if (t < 0) bad = "Update train: stable, rc or custom";
+        else c.update_train = (uint8_t)t;
     }
     if (!bad && (v = cJSON_GetObjectItem(j, "baud"))) {
         if (!cJSON_IsNumber(v) || v->valuedouble < 9600 || v->valuedouble > 921600) bad = "Baud rate must be 9600-921600";
@@ -1846,8 +1856,9 @@ static esp_err_t h_dongle_flash(httpd_req_t *req) {
 
 static esp_err_t h_metrics(httpd_req_t *req) {
     if (!authed(req)) {
+        // No Basic challenge: a browser would cache the password for the whole bridge and send it along with
+        // cross-site requests. Prometheus and curl -u send Basic credentials without being asked.
         httpd_resp_set_status(req, "401 Unauthorized");
-        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"zigbee-eth-bridge\"");
         return httpd_resp_sendstr(req, "login required\n");
     }
     bridge_stats_t g;
@@ -1949,11 +1960,12 @@ bool web_running(void) { return s_web_running; }
 // a client sending a header byte every few seconds would hold every other page (and Zigbee Studio) for an hour.
 // Every socket is tracked from accept to close; one that has sat outside a handler for STALL_US (headers never
 // finished, or an idle keep-alive) is first sent a FIN: a browser closes its end, the server's recv reads the end of
-// the stream and the session goes without a word in the log. One still there FIN_GRACE_US later is cut off with
-// SHUT_RDWR, which ends the server's recv at once (and the server logs "error in recv : 128" for it, rightly: that
-// client wouldn't let go). Every browser leaves a few idle keep-alives per visit, so cutting them all off filled the
-// log with that warning. close_fn takes the same lock before closing, so a socket number is never shut down after it
-// was handed to someone else.
+// the stream and the session goes. One still there FIN_GRACE_US later is cut off with SHUT_RDWR, which ends the
+// server's recv at once. Browsers often notice a FIN only when they next look at the socket, so a page's idle
+// keep-alives regularly reach that cut, and esp_http_server warns "httpd_sock_err: error in recv : 128" for each:
+// a few per visit, all routine. Its httpd_txrx tag is therefore kept to errors (web_start); a request cut off
+// inside a handler, the case that matters, gets a warning of our own. close_fn takes the same lock before closing,
+// so a socket number is never shut down after it was handed to someone else.
 #define STALL_US (20 * 1000 * 1000LL)
 #define FIN_GRACE_US (5 * 1000 * 1000LL)
 #define MON_SLOTS CONFIG_LWIP_MAX_SOCKETS
@@ -2061,6 +2073,9 @@ static void mon_task(void *arg) {
             }
             portEXIT_CRITICAL(&s_mon_mux);
             if (how >= 0) shutdown(m.fd, how);  // the server sees the end and closes it (through mon_close)
+            if (how == SHUT_RDWR && m.busy)
+                ESP_LOGW(TAG, "Cut off a request still running after %lld s (a client that stopped reading or sending)",
+                         (long long)((now - m.busy_us) / 1000000));
         }
         xSemaphoreGive(s_mon_lock);
     }
@@ -2080,6 +2095,9 @@ void web_start(void) {
     cfg.send_wait_timeout = 10;
     cfg.open_fn = mon_open;
     cfg.close_fn = mon_close;
+    // esp_http_server warns about every socket a client drops or the stall monitor cuts ("httpd_sock_err: error in
+    // recv : 128"): routine for a web server, noise in the bridge's log. Its real errors still show.
+    esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
     httpd_handle_t srv;
     if (httpd_start(&srv, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server failed to start");

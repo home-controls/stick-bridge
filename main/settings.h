@@ -29,8 +29,9 @@ typedef struct {
     char fw_repo[64];      // GitHub owner/name with dongle firmware releases (fwcat.c)
     bool fw_prerelease;    // include pre-releases (Nerivec publishes new SDKs as pre-releases first)
     uint8_t role;          // BRIDGE_ROLE_*: what the dongle is for (which firmware is offered/accepted)
-    char update_url[192];  // release manifest on git (updater.c)
+    char update_url[192];  // release manifest for the custom train (updater.c)
     bool update_auto;      // check for releases by itself
+    uint8_t update_train;  // ut_train_t (updtrain_core.h): stable, release candidates, or custom (update_url)
     // Every radio's link (radio_core.h). radios[0] is the radio above: its allow/tcp_port/baud/role are the flat
     // fields (those win on save); only its name is its own. The others have their own keys (r1_*, r2_*, r3_*).
     // All of it applies live: ports rebind, bauds switch, hosts apply to the next connection.
