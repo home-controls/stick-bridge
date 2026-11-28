@@ -1,6 +1,6 @@
 """Host tests for the USB-serial arithmetic, the dongle catalogue and protocol detection
 (main/usbser_core.c, dongles.c, protodetect.c), built in WSL with ASan + UBSan: chip by VID:PID,
-CH340 and FTDI baud divisors (Linux values), FTDI status-byte stripping, catalogue matches for real
+FTDI status-byte stripping (baud rates: test_serial_baud.py), catalogue matches for real
 USB strings, and detection of ASH, ZNP, deCONZ, ZiGate and Spinel frames (not random noise).
 
   python test_usbser.py
