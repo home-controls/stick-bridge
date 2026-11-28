@@ -142,8 +142,9 @@ dashboard serving. A crash or watchdog before that, or no network/dashboard with
 back to the previous firmware by itself. The old firmware then says so (event log, System page) and warns
 before the same version is installed again.
 
-Releases are cut by GitHub Actions from a tag on `main`: see [RELEASING.md](RELEASING.md). Versions are `x.y.z`
-or `x.y.z-rcN` (release candidates, published as GitHub pre-releases, which `releases/latest` never serves);
+Releases are cut by GitHub Actions from a tag on `main`: see [RELEASING.md](RELEASING.md). `version.txt` holds the
+version being prepared (`x.y.z`); a `vx.y.z-rcN` tag builds that commit as a release candidate (published as a
+GitHub pre-release, which `releases/latest` never serves) and `vx.y.z` as the release;
 `main/version_core.c` orders them, an RC below its release, so a bridge on an RC is offered the release.
 `tools/publish_release.py --assets-only` is the step CI runs to write the release files (`zigbee_eth_bridge-<v>.bin`,
 its `.bin.md5`, `manifest.json`, the first-flash `zigbee_eth_bridge-<v>-full.bin`, `dongles.json` and `SHA256SUMS`

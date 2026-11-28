@@ -60,6 +60,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       runner: ubuntu-24.04
+      version: ${{ needs.info.outputs.version }}
     secrets:
       PRIVATE_PATTERNS: ${{ secrets.PRIVATE_PATTERNS }}
 

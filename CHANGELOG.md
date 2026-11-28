@@ -4,7 +4,7 @@ Each version's notes are what the bridge shows before installing it, so keep the
 
 ## 2.2.0
 
-Release candidates: a bridge running an RC (from the GitHub pre-releases) is offered the final release when it comes out. Bridges set up before the rename move their update source to the new address by themselves. The CH340/CH341 and FTDI baud-rate code was rewritten: same values at every standard rate, and FTDI sticks no longer get divisors the chip doesn't have (above 1.5 Mbaud, below 184 baud).
+A bridge on a release candidate (GitHub pre-releases) is offered the final release. Bridges set up before the rename move their update source to the new address. The log no longer fills with "error in recv : 128" from closed browser connections. CH340/CH341 and FTDI baud rates rewritten: same at every standard rate; FTDI no longer gets divisors the chip lacks (above 1.5 Mbaud, below 184 baud).
 
 ## 2.1.3
 

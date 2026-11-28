@@ -1,12 +1,14 @@
 """The version this repository is at, checked in every file that states it, and its release notes.
 
     python tools/release_info.py                     # prints the version; fails if the files disagree
-    python tools/release_info.py --tag v1.2.3        # ...or if the tag isn't that version
+    python tools/release_info.py --tag v1.2.3        # ...or if the tag isn't that version (prints the tag's)
     python tools/release_info.py --notes notes.md    # writes this version's CHANGELOG.md section
 
-Versions are x.y.z (a release) or x.y.z-rcN (a release candidate, published as a GitHub pre-release; see
-docs/RELEASING.md). A release candidate's notes are its own '## x.y.z-rcN' section if the changelog has one,
-else the '## x.y.z' section it is a candidate for, either way prefixed with "Release candidate N of x.y.z".
+The files state the version being prepared, always a plain x.y.z. Tags decide what gets published (see
+docs/RELEASING.md): v1.2.3-rc1, v1.2.3-rc2, ... are release candidates of the files' 1.2.3 (GitHub
+pre-releases), and v1.2.3 is the release itself, usually on the same commit as the last release candidate.
+A release candidate's notes are its own '## x.y.z-rcN' section if the changelog has one, else the
+'## x.y.z' section, prefixed with "Release candidate N of x.y.z, for testing."
 
 The release workflow runs it first: a tag that doesn't match the files, or a version without a
 changelog entry, releases nothing. Standard library only, the same script in every Zigbee app repo
@@ -29,7 +31,7 @@ CHANGELOG = 'CHANGELOG.md'
 NOTES_MAX = 500  # bytes: the bridge shows (and keeps) only that much before installing
 # ----
 
-PLAIN = re.compile(r"^\d+\.\d+\.\d+(-rc[1-9]\d*)?$")  # x.y.z or x.y.z-rcN
+PLAIN = re.compile(r"^\d+\.\d+\.\d+$")  # what the files state
 RC = re.compile(r"^(\d+\.\d+\.\d+)-rc([1-9]\d*)$")
 
 
@@ -50,7 +52,7 @@ def notes_for(version: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tag", help="the release tag (v<version>); must match the files")
+    ap.add_argument("--tag", help="the release tag: v<version>, or v<version>-rcN for a release candidate")
     ap.add_argument("--notes", type=Path, help="write the release notes (this version's changelog section) here")
     a = ap.parse_args()
 
@@ -61,9 +63,14 @@ def main() -> int:
         problems.append("the files disagree: " + ", ".join(f"{p} says {v or 'nothing'}" for p, v in found.items()))
     version = next(iter(versions)) if len(versions) == 1 else ""
     if version and not PLAIN.match(version):
-        problems.append(f"{version} isn't a release version (x.y.z, or x.y.z-rcN for a release candidate)")
-    if a.tag is not None and version and a.tag != f"v{version}":
-        problems.append(f"the tag is {a.tag}, the files say {version} (tag v{version})")
+        problems.append(f"{version} isn't a plain x.y.z version (release candidates come from the tag: vx.y.z-rcN)")
+    if a.tag is not None and version:
+        tagged = a.tag[1:] if a.tag.startswith("v") else ""
+        m = RC.match(tagged)
+        if tagged != version and not (m and m.group(1) == version):
+            problems.append(f"the tag is {a.tag}, the files say {version} (tag v{version}, or v{version}-rcN)")
+        else:
+            version = tagged  # what gets published: the release, or one of its release candidates
     notes = notes_for(version) if version else ""
     rc = RC.match(version) if version else None
     if rc and not notes:
