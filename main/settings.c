@@ -404,6 +404,12 @@ static void load(void) {
         s_has_tok = nvs_get_blob(h, "tok_hash", s_tok_hash, &tl) == ESP_OK && tl == sizeof(s_tok_hash);
         nvs_close(h);
     }
+    // The repository was renamed (zigbee-bridge -> stick-bridge, 2.1.3). GitHub redirects the old address, but a
+    // bridge that saved the old default keeps it for good: move exactly that one to the new default.
+    if (strcmp(s_cfg.update_url, "https://github.com/home-controls/zigbee-bridge/releases/latest/download/manifest.json") == 0) {
+        ESP_LOGI(TAG, "Update source: the repository's old address, moved to the new default");
+        strlcpy(s_cfg.update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, sizeof(s_cfg.update_url));
+    }
     if (strncmp(s_cfg.update_url, "https://", 8) != 0) {  // saved by an older version that allowed http://
         ESP_LOGW(TAG, "Update source '%s' isn't https: back to the default", s_cfg.update_url);
         strlcpy(s_cfg.update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, sizeof(s_cfg.update_url));

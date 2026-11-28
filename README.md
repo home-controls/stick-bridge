@@ -132,6 +132,8 @@ reaches `main` through a reviewed pull request with passing checks. Security pro
 
 ## How releases are made
 
+Every release is tried first as a release candidate (a GitHub pre-release, which bridges only get if
+you install it on purpose: see [docs/RELEASING.md](docs/RELEASING.md#4-testing-a-release-candidate)).
 Every release is built by GitHub Actions from a tagged commit on `main`: the host tests
 run, the firmware is built, and the release files come with a `SHA256SUMS` file and a signed record of
 how and from which commit they were built. The bridge itself checks an update's size, MD5 and SHA-256

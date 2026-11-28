@@ -1,5 +1,6 @@
 # A release: push a tag v<version> (version.txt) on a commit that is on main (merged through a pull request).
-# See docs/RELEASING.md.
+# See docs/RELEASING.md. A tag v<x.y.z>-rcN is a release candidate: published as a GitHub pre-release, which
+# releases/latest (the bridges' default update feed) never serves, so only testers who install it get it.
 #   1. checks the tag against version.txt and CHANGELOG.md, and that the tagged commit is on main
 #   2. runs CI on GitHub's hosted runners (never the self-hosted one), which builds the firmware and the
 #      release files
@@ -11,7 +12,7 @@ name: Release
 
 on:
   push:
-    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"]
   workflow_dispatch:
 
 permissions: {}
@@ -101,5 +102,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 tools/release_info.py --tag "$GITHUB_REF_NAME" --notes "$RUNNER_TEMP/notes.md" >/dev/null
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "Stick Bridge $VERSION" \
+          case "$VERSION" in
+            *-rc*) kind=(--prerelease --latest=false); title="Stick Bridge $VERSION (release candidate)" ;;
+            *) kind=(--latest); title="Stick Bridge $VERSION" ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$title" "${kind[@]}" \
             --notes-file "$RUNNER_TEMP/notes.md" dist/*

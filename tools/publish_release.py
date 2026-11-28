@@ -21,6 +21,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import re
 import os
 import subprocess
 import sys
@@ -86,8 +87,8 @@ def main() -> None:
         sys.exit(f"the image is {project!r}, not zigbee_eth_bridge")
     if version != want:
         sys.exit(f"the image says {version}, version.txt says {want}: build again")
-    if "+" in version or "-" in version:
-        sys.exit(f"{version} is a test build: releases are plain x.y.z")
+    if not re.match(r"^\d+\.\d+\.\d+(-rc[1-9]\d*)?$", version):
+        sys.exit(f"{version} is a test build: releases are x.y.z, or x.y.z-rcN for a release candidate")
 
     if a.github or a.assets_only:
         out = HERE / "release" / version
