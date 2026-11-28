@@ -6,7 +6,7 @@ import { auth, config, loadAuth, loadConfig, post, rebootNeeded, toast } from ".
 import { Card, Field, Seg, copyText } from "../ui";
 import { Icon } from "../icons";
 import { confirmIt } from "../dialog";
-import type { Config } from "../types";
+import type { Config, UpdateTrain } from "../types";
 import { Msg, RadiosSettingsCard } from "./Radios";
 
 function useDraft(): [Config | null, (p: Partial<Config>) => void, () => void] {
@@ -188,17 +188,36 @@ function PasswordCard() {
   );
 }
 
+const TRAIN_HELP: Record<UpdateTrain, string> = {
+  stable: "The tested releases. What every bridge should run.",
+  rc: "Release candidates too: each release is offered here first, for testing, and the release itself when it follows. Going back to Stable keeps the candidate until the next release is newer.",
+  custom: "Your own release manifest, for firmware you build and host yourself.",
+};
+
 function UpdatesCard() {
   const [d, upd] = useDraft();
   const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
   if (!d) return <Card title="Updates" class="span-all"><p class="muted">Loading…</p></Card>;
+  const train: UpdateTrain = d.update_train ?? "stable";
+  const submit = async () => {
+    const before = config.value?.update_train ?? "stable";
+    await save({ update_train: train, update_url: d.update_url.trim(), update_auto: d.update_auto }, setM);
+    // a new train: look for its releases at once instead of at the next scheduled check
+    if (config.value?.update_train === train && train !== before) { try { await post("/api/update/check"); } catch { /* shown on System */ } }
+  };
   return (
     <Card title={<><Icon name="refresh" size={18} /> Updates</>} class="span-all">
-      <form onSubmit={(e) => { e.preventDefault(); void save({ update_url: d.update_url.trim(), update_auto: d.update_auto }, setM); }}>
+      <form onSubmit={(e) => { e.preventDefault(); void submit(); }}>
         <div class="form-grid update-form">
-          <Field label="Release manifest on git" help="The bridge reads this file to find new firmware; each release names its image with its MD5 and SHA-256, and the bridge checks both before switching.">
-            <input value={d.update_url} spellcheck={false} onInput={(e) => upd({ update_url: (e.target as HTMLInputElement).value })} />
+          <Field label="Release train" help={TRAIN_HELP[train]}>
+            <Seg label="Release train" value={train} onChange={(v) => upd({ update_train: v as UpdateTrain })}
+              options={[{ v: "stable", label: "Stable" }, { v: "rc", label: "Release candidates" }, { v: "custom", label: "Custom" }]} />
           </Field>
+          {train === "custom" && (
+            <Field label="Release manifest" help="The bridge reads this file to find new firmware; each release names its image with its MD5 and SHA-256, and the bridge checks both before switching. https only.">
+              <input value={d.update_url} spellcheck={false} onInput={(e) => upd({ update_url: (e.target as HTMLInputElement).value })} />
+            </Field>
+          )}
           <Field label="Check by itself" help="One minute after starting, then every 6 hours. Installing always waits for you.">
             <Seg label="Automatic checks" value={d.update_auto ? "on" : "off"} onChange={(v) => upd({ update_auto: v === "on" })}
               options={[{ v: "on", label: "On" }, { v: "off", label: "Off" }]} />

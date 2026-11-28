@@ -24,6 +24,7 @@ import adapter_sim  # noqa: E402
 
 sim = adapter_sim.AdapterSim()
 sim.cfg.update({"update_url": "https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json", "update_auto": True,
+                "update_train": "stable",
                 "tx_chunk": 64, "tx_gap_us": 300, "xoff_honor": True, "xoff_max_ms": 20, "hw_flow": False,
                 "fw_repo": "Nerivec/silabs-firmware-builder", "fw_prerelease": True, "role": "zigbee"})
 # Example LAN addresses (the README's): the bridge at .50, Home Assistant (where Zigbee2MQTT connects from) at .10
@@ -369,12 +370,23 @@ async def config_post(r):
     return web.json_response({**after, "reboot_required": reboot})
 
 
-UPD = {"state": "available", "current": "1.0.9", "latest": "1.0.10", "notes": "Dashboard layout fixes.\nUpdates from git with MD5 and SHA-256 checks.",
-       "date": "2026-11-21", "size": 766000, "done": 0, "md5": "0" * 32, "sha256": "f" * 64, "checked_ago": 42, "error": "",
+UPD = {"state": "available", "current": "2.1.3", "latest": "2.2.0", "notes": "Release candidates, a quieter log, rewritten baud rates.",
+       "date": "2026-11-28", "size": 1137000, "done": 0, "md5": "0" * 32, "sha256": "f" * 64, "checked_ago": 42, "error": "",
        "source": sim.cfg.get("update_url", ""), "auto": True}
+# what each train offers in the mock (the real bridge reads GitHub)
+TRAIN_LATEST = {"stable": ("2.2.0", False), "rc": ("2.3.0-rc1", True), "custom": ("2.2.0", False)}
 
 
 async def update_get(_r):
+    train = sim.cfg.get("update_train", "stable")
+    latest, pre = TRAIN_LATEST.get(train, TRAIN_LATEST["stable"])
+    UPD.update({"train": train, "latest_prerelease": pre,
+                "source": sim.cfg["update_url"] if train == "custom" else
+                ("https://github.com/home-controls/stick-bridge/releases" if train == "rc" else
+                 "https://github.com/home-controls/stick-bridge/releases/latest/download/manifest.json")})
+    if UPD["state"] in ("available", "uptodate") and UPD["latest"] != latest:
+        UPD["latest"] = latest
+        UPD["notes"] = ("Release candidate 1 of 2.3.0, for testing. " if pre else "") + "Release candidates, a quieter log, rewritten baud rates."
     if UPD["state"] == "downloading":
         UPD["done"] = min(UPD["size"], UPD["done"] + 90000)
         if UPD["done"] >= UPD["size"]:

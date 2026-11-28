@@ -1,4 +1,5 @@
 #include "settings.h"
+#include "updtrain_core.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -61,6 +62,7 @@ static void defaults(bridge_settings_t *c) {
     c->fw_prerelease = true;
     strlcpy(c->update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, sizeof(c->update_url));
     c->update_auto = true;
+    c->update_train = UT_STABLE;
     for (int i = 0; i < RADIO_MAX; i++) radio_link_default(i, &c->radios[i]);
     c->usb_fs_only = true;
 }
@@ -339,6 +341,7 @@ static void migrate_v2(void) {
 
 static void load(void) {
     defaults(&s_cfg);
+    bool train_unset = false;
     nvs_handle_t h;
     if (nvs_open(NS, NVS_READONLY, &h) == ESP_OK) {
         size_t len = sizeof(s_cfg.hostname);
@@ -369,6 +372,9 @@ static void load(void) {
         nvs_get_str(h, "upd_url", s_cfg.update_url, &len);
         uint8_t ua;
         if (nvs_get_u8(h, "upd_auto", &ua) == ESP_OK) s_cfg.update_auto = ua != 0;
+        uint8_t ut;
+        if (nvs_get_u8(h, "upd_train", &ut) == ESP_OK && ut < UT_COUNT) s_cfg.update_train = ut;
+        else train_unset = true;  // saved before trains existed: decided from the saved address below
         uint8_t fs;
         if (nvs_get_u8(h, "usb_fs", &fs) == ESP_OK) s_cfg.usb_fs_only = fs != 0;
         char k[16];
@@ -404,10 +410,19 @@ static void load(void) {
         s_has_tok = nvs_get_blob(h, "tok_hash", s_tok_hash, &tl) == ESP_OK && tl == sizeof(s_tok_hash);
         nvs_close(h);
     }
+    // The repository was renamed (zigbee-bridge -> stick-bridge, 2.1.3). GitHub redirects the old address, but a
+    // bridge that saved the old default keeps it for good: move exactly that one to the new default.
+    if (strcmp(s_cfg.update_url, "https://github.com/home-controls/zigbee-bridge/releases/latest/download/manifest.json") == 0) {
+        ESP_LOGI(TAG, "Update source: the repository's old address, moved to the new default");
+        strlcpy(s_cfg.update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, sizeof(s_cfg.update_url));
+    }
     if (strncmp(s_cfg.update_url, "https://", 8) != 0) {  // saved by an older version that allowed http://
         ESP_LOGW(TAG, "Update source '%s' isn't https: back to the default", s_cfg.update_url);
         strlcpy(s_cfg.update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, sizeof(s_cfg.update_url));
     }
+    // Before trains (2.2.0) the address was all there was: the default address is the stable train, anything else
+    // was set on purpose and stays as the custom train.
+    if (train_unset) s_cfg.update_train = strcmp(s_cfg.update_url, CONFIG_BRIDGE_DEFAULT_UPDATE_URL) == 0 ? UT_STABLE : UT_CUSTOM;
     // A saved rule that no longer reads (damaged settings) shuts the radio rather than opening it to the whole LAN:
     // the raw radio port gives whoever connects the network key. Set it again on Settings, Radios.
     uint32_t a, m;
@@ -496,6 +511,10 @@ esp_err_t settings_save(const bridge_settings_t *in_raw, bool *reboot_needed, ch
         snprintf(err, err_len, "TCP port must be 1-65535 and not 80");
         return ESP_ERR_INVALID_ARG;
     }
+    if (in->update_train >= UT_COUNT) {
+        snprintf(err, err_len, "Update train must be stable, rc or custom");
+        return ESP_ERR_INVALID_ARG;
+    }
     // https only: over plain http anyone on the path could hand the bridge a manifest, and with it the image's hashes
     if (strncmp(in->update_url, "https://", 8) != 0) {
         snprintf(err, err_len, "Update source must be an https:// address");
@@ -577,6 +596,7 @@ esp_err_t settings_save(const bridge_settings_t *in_raw, bool *reboot_needed, ch
     nvs_set_u8(h, "role", in->role);
     nvs_set_str(h, "upd_url", in->update_url);
     nvs_set_u8(h, "upd_auto", in->update_auto ? 1 : 0);
+    nvs_set_u8(h, "upd_train", in->update_train);
     nvs_set_u8(h, "usb_fs", in->usb_fs_only ? 1 : 0);
     for (int i = 0; i < RADIO_MAX; i++) nvs_link(h, i, &in->radios[i]);
     e = nvs_commit(h);

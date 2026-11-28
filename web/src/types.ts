@@ -15,10 +15,15 @@ export interface Ash {
   error: number; retx: number; crc_err: number; cancel: number; substitute: number; oversize: number;
 }
 
+/** Which releases the bridge offers: the stable releases, release candidates too, or a custom manifest address. */
+export type UpdateTrain = "stable" | "rc" | "custom";
+
 export interface UpdateState {
   state: "idle" | "checking" | "uptodate" | "available" | "downloading" | "rebooting" | "error";
   current: string; latest: string; notes: string; date: string; size: number; done: number;
   md5: string; sha256: string; checked_ago: number; error: string; source: string; auto: boolean;
+  /** 2.2.0+: the update train, the manifest the last check read, and whether the latest is a release candidate. */
+  train?: UpdateTrain; manifest?: string; latest_prerelease?: boolean;
   /** A firmware that was installed but didn't start, so the bridge went back ('' if none). */
   rolled_back?: string;
 }
@@ -128,6 +133,7 @@ export interface ZbDevice {
 export interface Config {
   hostname: string; mode: "static" | "dhcp"; ip: string; mask: string; gw: string; dns: string;
   allow: string; tcp_port: number; baud: number; update_url: string; update_auto: boolean;
+  update_train?: UpdateTrain;  // 2.2.0+
   tx_chunk?: number; tx_gap_us?: number; xoff_honor?: boolean; xoff_max_ms?: number;  // 1.0.17+
   hw_flow?: boolean;  // 1.0.18+
   fw_repo?: string; fw_prerelease?: boolean;  // 1.0.19+

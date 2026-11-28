@@ -2,6 +2,7 @@
 #include "tasks.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/time.h>
@@ -18,6 +19,9 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "fwcheck.h"
+#include "fwcat_core.h"
+#include "updtrain_core.h"
+#include "version_core.h"
 #include "mbedtls/md5.h"
 #include "mbedtls/sha256.h"
 #include "net.h"
@@ -59,6 +63,7 @@ typedef struct {
     int64_t checked_epoch;
     char error[120];
     int done;           // bytes downloaded
+    char source[256];   // the manifest the last check read (the train's, resolved)
 } up_t;
 
 static up_t s_up;
@@ -101,7 +106,14 @@ static bool is_hex(const char *s, size_t n) {
     return true;
 }
 
-static const char *update_url(const bridge_settings_t *cfg) { return TEST_LOOP ? TEST_URL : cfg->update_url; }
+// Where the update train in Settings is read from, before any check: the stable train's manifest, the custom address,
+// or (release candidates) the releases list it is picked from.
+static void train_source(const bridge_settings_t *cfg, char *out, size_t cap) {
+    if (TEST_LOOP) strlcpy(out, TEST_URL, cap);
+    else if (cfg->update_train == UT_CUSTOM) strlcpy(out, cfg->update_url, cap);
+    else if (cfg->update_train == UT_RC) strlcpy(out, "https://github.com/" CONFIG_BRIDGE_UPDATE_REPO "/releases", cap);
+    else strlcpy(out, CONFIG_BRIDGE_DEFAULT_UPDATE_URL, cap);
+}
 
 // GitHub release downloads redirect twice, the second time to a signed release-assets.githubusercontent.com
 // address of ~900 characters: the address buffer and the header buffers must hold it (a 256-byte buffer cut it
@@ -120,7 +132,7 @@ typedef struct {
 static esp_err_t on_http_event(esp_http_client_event_t *e) {
     location_t *l = e->user_data;
     if (l && e->event_id == HTTP_EVENT_ON_HEADER && e->header_key && e->header_value && strcasecmp(e->header_key, "Location") == 0)
-        strlcpy(l->buf, e->header_value, l->cap);
+        if (strlcpy(l->buf, e->header_value, l->cap) >= l->cap) l->buf[0] = 0;  // cut off = no usable redirect
     return ESP_OK;
 }
 
@@ -181,6 +193,9 @@ static esp_http_client_handle_t open_url(const char *url, int *status, int64_t *
             bool redirect = *status == 301 || *status == 302 || *status == 303 || *status == 307 || *status == 308;
             if (*status == 0 || *len < -1) *why = "no answer";  // -1 is a chunked response (no length), not an error
             else if (!redirect) {
+                // the caller reads the body with this client: the handler must not keep pointing at loc, whose buffer
+                // is freed below (chunked trailers go through the header callback too)
+                esp_http_client_set_user_data(c, NULL);
                 ret = c;
                 break;
             } else if (hop >= 4) *why = "too many redirects";
@@ -230,6 +245,69 @@ static esp_http_client_handle_t open_url_retry(const char *url, int *status, int
 
 static void do_install(void);
 
+// ---------------------------------------------------------------- update trains
+
+static void rc_asset(void *ctx, const fc_release_t *rel, const fc_asset_t *a) { ut_consider(ctx, rel->tag, a->name, a->url); }
+
+#define RC_LIST_MAX (1024 * 1024)        // bytes of the releases list read at most (10 releases are ~60 KB)
+#define RC_LIST_DEADLINE_US (60 * 1000000LL)
+
+// The manifest to read for the train in Settings. Stable: the latest release (GitHub never serves a pre-release
+// there). Release candidates: the newest version among the repository's 10 most recent releases that has a
+// manifest.json, read from GitHub's API as a stream (updtrain_core.c picks it). Custom: the address in Settings.
+static esp_err_t resolve_manifest(const bridge_settings_t *cfg, char *out, size_t cap, char *why, size_t why_len) {
+    if (TEST_LOOP || cfg->update_train != UT_RC) {
+        train_source(cfg, out, cap);
+        return ESP_OK;
+    }
+    int status = 0;
+    int64_t len;
+    const char *w = "can't connect";
+    esp_http_client_handle_t c =
+        open_url_retry("https://api.github.com/repos/" CONFIG_BRIDGE_UPDATE_REPO "/releases?per_page=10", &status, &len, &w);
+    if (!c) {
+        snprintf(why, why_len, "GitHub's releases list: %s", w);
+        return ESP_FAIL;
+    }
+    if (status != 200) {
+        esp_http_client_cleanup(c);
+        if (status == 403 || status == 429) snprintf(why, why_len, "GitHub's API limit was reached (HTTP %d): try again in an hour", status);
+        else snprintf(why, why_len, "GitHub's releases list answered HTTP %d", status);
+        return ESP_FAIL;
+    }
+    fc_json_t *j = malloc(sizeof(*j));
+    ut_pick_t *p = malloc(sizeof(*p));
+    char *buf = malloc(2048);
+    esp_err_t e = ESP_FAIL;
+    if (!j || !p || !buf) {
+        snprintf(why, why_len, "out of memory");
+    } else {
+        ut_pick_init(p);
+        fc_json_init(j, rc_asset, p);
+        size_t total = 0;
+        int64_t t0 = esp_timer_get_time();
+        for (;;) {
+            int r = esp_http_client_read(c, buf, 2048);
+            if (r <= 0) break;
+            fc_json_feed(j, buf, (size_t)r);
+            total += (size_t)r;
+            if (total > RC_LIST_MAX || esp_timer_get_time() - t0 > RC_LIST_DEADLINE_US) break;
+        }
+        if (p->found) {
+            strlcpy(out, p->url, cap);
+            ESP_LOGI(TAG, "Release-candidate train: newest release is %s", p->tag);
+            e = ESP_OK;
+        } else {
+            snprintf(why, why_len, "no release on GitHub has a manifest.json");
+        }
+    }
+    esp_http_client_cleanup(c);
+    free(buf);
+    free(p);
+    free(j);
+    return e;
+}
+
 static void do_check(void) {
     bridge_settings_t cfg;
     settings_get(&cfg);
@@ -242,12 +320,14 @@ static void do_check(void) {
     s_up.error[0] = 0;
     xSemaphoreGive(s_lock);
 
+    char src[256], rwhy[96];
+    if (resolve_manifest(&cfg, src, sizeof(src), rwhy, sizeof(rwhy)) != ESP_OK) return set_error("Update check failed: %s", rwhy);
     char *body = malloc(MANIFEST_MAX + 1);
     if (!body) return set_error("Update check failed: out of memory%s", NULL);
     int status = 0, n = 0;
     int64_t len;
     const char *why = NULL;
-    esp_http_client_handle_t c = open_url_retry(update_url(&cfg), &status, &len, &why);
+    esp_http_client_handle_t c = open_url_retry(src, &status, &len, &why);
     if (c) {
         while (n < MANIFEST_MAX) {
             int r = esp_http_client_read(c, body + n, MANIFEST_MAX - n);
@@ -285,7 +365,7 @@ static void do_check(void) {
     if (strncmp(file->valuestring, "https://", 8) == 0 || strncmp(file->valuestring, "http://", 7) == 0) {
         strlcpy(url, file->valuestring, sizeof(url));
     } else {  // relative to the manifest
-        strlcpy(url, update_url(&cfg), sizeof(url));
+        strlcpy(url, src, sizeof(url));
         char *slash = strrchr(url, '/');
         if (slash) slash[1] = 0;
         strlcat(url, file->valuestring, sizeof(url));
@@ -303,6 +383,7 @@ static void do_check(void) {
     strlcpy(s_up.notes, cJSON_IsString(notes) ? notes->valuestring : "", sizeof(s_up.notes));
     strlcpy(s_up.date, cJSON_IsString(date) ? date->valuestring : "", sizeof(s_up.date));
     s_up.size = (int)size->valuedouble;
+    strlcpy(s_up.source, src, sizeof(s_up.source));
     s_up.state = newer ? UP_AVAILABLE : UP_UPTODATE;
     s_up.checked_up_s = stats_uptime_s();
     s_up.checked_epoch = epoch_now();
@@ -526,7 +607,12 @@ void updater_add_json(cJSON *root) {
     cJSON_AddStringToObject(o, "sha256", u.sha256);
     cJSON_AddNumberToObject(o, "checked_ago", u.checked_up_s ? (double)(stats_uptime_s() - u.checked_up_s) : -1);
     cJSON_AddStringToObject(o, "error", u.error);
-    cJSON_AddStringToObject(o, "source", update_url(&cfg));
+    char where[256];
+    train_source(&cfg, where, sizeof(where));
+    cJSON_AddStringToObject(o, "train", ut_name((ut_train_t)cfg.update_train));
+    cJSON_AddStringToObject(o, "source", where);       // where the train is read from
+    cJSON_AddStringToObject(o, "manifest", u.source);  // the manifest the last check read ("" before one)
+    cJSON_AddBoolToObject(o, "latest_prerelease", u.latest[0] && ver_is_prerelease(u.latest));
     cJSON_AddBoolToObject(o, "auto", cfg.update_auto);
     cJSON_AddStringToObject(o, "rolled_back", s_rolled_back);
 }

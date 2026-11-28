@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "main.c" "settings.c" "net.c" "dongle.c" "bridge.c" "ezsp_decode.c" "stats.c" "web.c" "logbuf.c"
-         "sysinfo.c" "watchdog.c" "fwcheck.c" "updater.c" "ncpflash.c" "ncpflash_core.c"
-         "logstore.c" "logstore_core.c" "sdlog.c" "txpace_core.c" "usbser.c" "usbser_core.c" "dongles.c" "protodetect.c" "radio_core.c" "tasks.c" "fwcat.c" "fwcat_core.c" "xflash.c" "unzip_core.c" "ihex_core.c" "tiflash_core.c" "gcfflash_core.c" "nrfdfu_core.c"
+         "sysinfo.c" "watchdog.c" "fwcheck.c" "version_core.c" "updtrain_core.c" "updater.c" "ncpflash.c" "ncpflash_core.c"
+         "logstore.c" "logstore_core.c" "sdlog.c" "txpace_core.c" "usbser.c" "usbser_core.c" "serial_baud.c" "dongles.c" "protodetect.c" "radio_core.c" "tasks.c" "fwcat.c" "fwcat_core.c" "xflash.c" "unzip_core.c" "ihex_core.c" "tiflash_core.c" "gcfflash_core.c" "nrfdfu_core.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES esp_eth esp_netif esp_event nvs_flash esp_timer esp_http_server app_update
                   esp_app_format esp_partition esp_driver_gpio esp_driver_tsens lwip usb esp_ringbuf
