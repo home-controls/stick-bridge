@@ -25,7 +25,10 @@ directory so the test version doesn't stick in the main build:
 idf.py -B build-rc -DBRIDGE_VER=2.1.2-rc1 build     # testing what becomes 2.1.3
 ```
 
-then upload `build-rc/zigbee_eth_bridge.bin` on **System → Firmware**. The bridge keeps it only if it
+In PowerShell, quote the option (`"-DBRIDGE_VER=2.1.2-rc1"`), or PowerShell splits it at the first dot. Add
+`"-DSDKCONFIG=build-rc/sdkconfig"` to build from `sdkconfig.defaults` like CI does, rather than your local `sdkconfig`.
+
+Then upload `build-rc/zigbee_eth_bridge.bin` on **System → Firmware**. The bridge keeps it only if it
 starts properly (trial boot, see [TECHNICAL.md](TECHNICAL.md#updates-from-git)). Use a throwaway
 password on test bridges, never a real one.
 

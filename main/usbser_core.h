@@ -1,7 +1,7 @@
 #pragma once
 // USB-to-serial chips the dongles use, the parts that are plain arithmetic (no ESP-IDF here, so
-// test/host/test_usbser.py checks them): which chip a VID:PID is, CH34x and FTDI baud divisors, and
-// FTDI's per-packet status bytes. The control requests themselves are in usbser.c.
+// test/host/test_usbser.py checks them): which chip a VID:PID is and FTDI's per-packet status bytes.
+// Baud rate values: serial_baud.h. The control requests themselves are in usbser.c.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -20,17 +20,6 @@ const char *us_chip_name(us_chip_t c);
 // The driver for a device. has_cdc: it has a CDC communications interface (class 0x02) — used for
 // devices whose VID:PID isn't one of the vendor chips.
 us_chip_t us_chip_for(uint16_t vid, uint16_t pid, bool has_cdc);
-
-// CH340/CH341 divisor/prescaler word for register pair 0x1312 (Linux ch341_get_divisor), or -1 when
-// the rate can't be made. chip_version > 0x27 sets bit 7 (don't hold RX until 32 bytes).
-int us_ch34x_divisor(uint32_t baud, uint8_t chip_version);
-// The rate that word really gives (for showing the error).
-uint32_t us_ch34x_actual(int divisor_word);
-
-// FTDI FT232R/FT-X ("BM" style) divisor: low 16 bits go in wValue, bits 16+ in wIndex (Linux
-// ftdi_232bm_baud_base_to_divisor with a 48 MHz base).
-uint32_t us_ftdi_divisor(uint32_t baud);
-uint32_t us_ftdi_actual(uint32_t divisor);
 
 // FTDI IN data: every max-packet chunk starts with 2 status bytes (modem, line). Strips them in place
 // and returns the payload length; the latest status bytes go to *modem / *line (OR'd line errors).

@@ -21,7 +21,6 @@ static int g_fail;
         }                                               \
     } while (0)
 
-static double err_pct(uint32_t want, uint32_t got) { return 100.0 * ((double)got - want) / want; }
 
 static void t_chip_for(void) {
     CHECK(us_chip_for(0x10C4, 0xEA60, false) == US_CP210X, "cp2102n");
@@ -32,33 +31,7 @@ static void t_chip_for(void) {
     CHECK(us_chip_for(0x1234, 0x5678, false) == US_NONE, "unknown, no cdc");
 }
 
-static void t_ch34x(void) {
-    const uint32_t rates[] = {9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 2000000};
-    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
-        int w = us_ch34x_divisor(rates[i], 0x30);
-        CHECK(w >= 0, "%u has a divisor", rates[i]);
-        CHECK(w & 0x80, "%u: bit 7 set for version 0x30", rates[i]);
-        uint32_t got = us_ch34x_actual(w);
-        double e = err_pct(rates[i], got);
-        CHECK(e > -2.0 && e < 2.0, "%u -> %u (%.2f%%)", rates[i], got, e);
-    }
-    CHECK((us_ch34x_divisor(115200, 0x27) & 0x80) == 0, "no bit 7 for old chips");
-    // Linux gives 0xcc03 for 115200 (div 0x100-0xcc=52 at ps 3 fact 0: 48e6/(8*52)=115384)
-    CHECK((us_ch34x_divisor(115200, 0) & 0xFF7F) == 0xCC03, "115200 word %04x", us_ch34x_divisor(115200, 0));
-}
-
 static void t_ftdi(void) {
-    CHECK(us_ftdi_divisor(115200) == 0x001A, "115200 -> %x", us_ftdi_divisor(115200));
-    CHECK(us_ftdi_divisor(460800) == 0x4006, "460800 -> %x", us_ftdi_divisor(460800));
-    CHECK(us_ftdi_divisor(921600) == 0x8003, "921600 -> %x", us_ftdi_divisor(921600));
-    CHECK(us_ftdi_divisor(3000000) == 0, "3M");
-    CHECK(us_ftdi_divisor(2000000) == 1, "2M");
-    CHECK(us_ftdi_divisor(9600) == 0x4138, "9600 -> %x", us_ftdi_divisor(9600));
-    const uint32_t rates[] = {9600, 57600, 115200, 230400, 460800, 921600, 1000000};
-    for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
-        double e = err_pct(rates[i], us_ftdi_actual(us_ftdi_divisor(rates[i])));
-        CHECK(e > -3.5 && e < 3.5, "%u -> %u (%.2f%%)", rates[i], us_ftdi_actual(us_ftdi_divisor(rates[i])), e);
-    }
     // two full packets and a short one: 64 + 64 + 5 bytes -> 62 + 62 + 3 payload
     uint8_t buf[133];
     for (int i = 0; i < 133; i++) buf[i] = (uint8_t)i;
@@ -386,7 +359,6 @@ static void t_ezsp_version(void) {
 int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "selftest") != 0) return 2;
     t_chip_for();
-    t_ch34x();
     t_ftdi();
     t_glob();
     t_match();
