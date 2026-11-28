@@ -44,7 +44,7 @@ licence comments, so they are listed here.
 
 | Package | Version | Licence | Copyright |
 | --- | --- | --- | --- |
-| preact | 10.29.8 | MIT | Copyright (c) 2015-present Jason Miller |
+| preact | 11.2.0 | MIT | Copyright (c) 2015-present Jason Miller |
 | @preact/signals | 2.11.4 | MIT | Copyright (c) 2022-present Preact Team |
 | @preact/signals-core | 1.14.5 | MIT | Copyright (c) 2022-present Preact Team |
 

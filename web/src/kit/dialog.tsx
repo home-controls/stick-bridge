@@ -62,8 +62,10 @@ export function Dialog() {
   const blocked = !!d.typeToConfirm && typed.trim() !== d.typeToConfirm;
   return (
     <div class="palette-back" onClick={() => close(null)} onKeyDown={(e) => e.key === "Escape" && close(null)}>
-      <form class="dialog" role="dialog" aria-modal="true" aria-label={d.title} onClick={(e) => e.stopPropagation()}
-        onSubmit={(e) => { e.preventDefault(); if (!blocked) close(values); }}>
+      {/* role="dialog" belongs on the container, not the form (ARIA in HTML allows a form no dialog role);
+          the form is display: contents, so the layout is the container's */}
+      <div class="dialog" role="dialog" aria-modal="true" aria-label={d.title} onClick={(e) => e.stopPropagation()}>
+      <form class="dialog-form" onSubmit={(e) => { e.preventDefault(); if (!blocked) close(values); }}>
         <h2>{d.danger && <Icon name="alert" size={18} />}{d.title}</h2>
         {d.body && <div class="dialog-body">{d.body}</div>}
         {(d.fields || []).map((f, i) => f.type === "checkbox" ? (
@@ -75,8 +77,11 @@ export function Dialog() {
         ) : (
           <label class="dialog-field">
             <span>{f.label}</span>
-            <input ref={i === 0 ? first : undefined} type={f.type || "text"} value={values[f.name] ?? ""} placeholder={f.placeholder}
-              onInput={(e) => setValues({ ...values, [f.name]: (e.target as HTMLInputElement).value })} />
+            {f.type === "number"
+              ? <input ref={i === 0 ? first : undefined} type="number" value={values[f.name] ?? ""} placeholder={f.placeholder}
+                  onInput={(e) => setValues({ ...values, [f.name]: (e.target as HTMLInputElement).value })} />
+              : <input ref={i === 0 ? first : undefined} type="text" value={values[f.name] ?? ""} placeholder={f.placeholder}
+                  onInput={(e) => setValues({ ...values, [f.name]: (e.target as HTMLInputElement).value })} />}
           </label>
         ))}
         {d.typeToConfirm && (
@@ -91,6 +96,7 @@ export function Dialog() {
           <button ref={okBtn} class={`btn ${d.danger ? "danger" : "primary"}`} disabled={blocked}>{d.confirm}</button>
         </div>
       </form>
+      </div>
     </div>
   );
 }
