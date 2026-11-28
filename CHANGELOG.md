@@ -2,6 +2,10 @@
 
 Each version's notes are what the bridge shows before installing it, so keep them under 500 bytes.
 
+## 2.2.0
+
+Release candidates: a bridge running an RC (from the GitHub pre-releases) is offered the final release when it comes out. Bridges set up before the rename move their update source to the new address by themselves. The CH340/CH341 and FTDI baud-rate code was rewritten: same values at every standard rate, and FTDI sticks no longer get divisors the chip doesn't have (above 1.5 Mbaud, below 184 baud).
+
 ## 2.1.3
 
 Security fixes (advisory GHSA-g7fj-vfx8-3h8f): every change now needs the dashboard's own request header, also when a browser sends a saved password, so another website can't change settings or install firmware; /metrics no longer makes browsers save the password; a download could write to freed memory. Please update.

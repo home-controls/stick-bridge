@@ -4,6 +4,10 @@
     python tools/release_info.py --tag v1.2.3        # ...or if the tag isn't that version
     python tools/release_info.py --notes notes.md    # writes this version's CHANGELOG.md section
 
+Versions are x.y.z (a release) or x.y.z-rcN (a release candidate, published as a GitHub pre-release; see
+docs/RELEASING.md). A release candidate's notes are its own '## x.y.z-rcN' section if the changelog has one,
+else the '## x.y.z' section it is a candidate for, either way prefixed with "Release candidate N of x.y.z".
+
 The release workflow runs it first: a tag that doesn't match the files, or a version without a
 changelog entry, releases nothing. Standard library only, the same script in every Zigbee app repo
 except for the settings below.
@@ -25,7 +29,8 @@ CHANGELOG = 'CHANGELOG.md'
 NOTES_MAX = 500  # bytes: the bridge shows (and keeps) only that much before installing
 # ----
 
-PLAIN = re.compile(r"^\d+\.\d+\.\d+$")
+PLAIN = re.compile(r"^\d+\.\d+\.\d+(-rc[1-9]\d*)?$")  # x.y.z or x.y.z-rcN
+RC = re.compile(r"^(\d+\.\d+\.\d+)-rc([1-9]\d*)$")
 
 
 def stated(path: str, how: str) -> str:
@@ -56,12 +61,17 @@ def main() -> int:
         problems.append("the files disagree: " + ", ".join(f"{p} says {v or 'nothing'}" for p, v in found.items()))
     version = next(iter(versions)) if len(versions) == 1 else ""
     if version and not PLAIN.match(version):
-        problems.append(f"{version} isn't a plain x.y.z release version")
+        problems.append(f"{version} isn't a release version (x.y.z, or x.y.z-rcN for a release candidate)")
     if a.tag is not None and version and a.tag != f"v{version}":
         problems.append(f"the tag is {a.tag}, the files say {version} (tag v{version})")
     notes = notes_for(version) if version else ""
+    rc = RC.match(version) if version else None
+    if rc and not notes:
+        notes = notes_for(rc.group(1))
     if version and not notes:
-        problems.append(f"{CHANGELOG} has no '## {version}' entry")
+        problems.append(f"{CHANGELOG} has no '## {version}' entry" + (f" (or '## {rc.group(1)}')" if rc else ""))
+    elif rc:
+        notes = f"Release candidate {rc.group(2)} of {rc.group(1)}, for testing. " + notes
     if NOTES_MAX and len(notes.encode()) > NOTES_MAX:
         problems.append(f"the {version} notes are {len(notes.encode())} bytes; keep them under {NOTES_MAX}")
     if problems:
